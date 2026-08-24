@@ -22,10 +22,12 @@ MQTT_USERNAME = os.getenv("CAREGRID_MQTT_USERNAME", "caregrid")
 MQTT_PASSWORD = os.getenv("CAREGRID_MQTT_PASSWORD", "")
 DB_PATH = Path(os.getenv("CAREGRID_DB_PATH", str(BASE_DIR / "data" / "caregrid.db")))
 
-app = FastAPI(title="CareGrid Raspberry Pi Gateway", version="0.1.1")
+app = FastAPI(title="CareGrid Raspberry Pi Gateway", version="0.2.0")
 
 mqtt_connected = False
 mqtt_lock = threading.Lock()
+state_lock = threading.Lock()
+device_state: dict[str, dict[str, Any]] = {}
 
 
 class TelemetryEnvelope(BaseModel):
@@ -76,6 +78,59 @@ def store_event(topic: str, event: TelemetryEnvelope) -> None:
         conn.commit()
 
 
+def discovery_component(value: Any) -> str:
+    return "binary_sensor" if isinstance(value, bool) else "sensor"
+
+
+def publish_home_assistant_discovery(client: mqtt.Client, event: TelemetryEnvelope) -> None:
+    state_topic = f"caregrid/state/{event.device_id}"
+    availability_topic = f"caregrid/device/{event.device_id}/availability"
+
+    for key, value in event.data.items():
+        component = discovery_component(value)
+        object_id = f"caregrid_{event.device_id}_{key}".replace("-", "_")
+        config_topic = f"homeassistant/{component}/{object_id}/config"
+
+        config: dict[str, Any] = {
+            "name": f"{event.device_id} {key.replace('_', ' ').title()}",
+            "unique_id": object_id,
+            "state_topic": state_topic,
+            "availability_topic": availability_topic,
+            "device": {
+                "identifiers": [f"caregrid_{event.device_id}"],
+                "name": event.device_id,
+                "manufacturer": "CareGrid",
+                "model": event.node_type,
+            },
+        }
+
+        if component == "binary_sensor":
+            config["value_template"] = f"{{{{ 'ON' if value_json.data.{key} else 'OFF' }}}}"
+            config["payload_on"] = "ON"
+            config["payload_off"] = "OFF"
+        else:
+            config["value_template"] = f"{{{{ value_json.data.{key} }}}}"
+
+        client.publish(config_topic, json.dumps(config), qos=1, retain=True)
+
+    client.publish(availability_topic, "online", qos=1, retain=True)
+    client.publish(state_topic, event.model_dump_json(), qos=1, retain=True)
+
+
+def update_live_state(client: mqtt.Client, event: TelemetryEnvelope) -> None:
+    state = {
+        "device_id": event.device_id,
+        "node_type": event.node_type,
+        "last_seen": utc_now(),
+        "online": True,
+        "data": event.data,
+    }
+    with state_lock:
+        device_state[event.device_id] = state
+
+    publish_home_assistant_discovery(client, event)
+
+
 def on_connect(client: mqtt.Client, userdata: Any, flags: Any, reason_code: mqtt.ReasonCode, properties: Any = None) -> None:
     global mqtt_connected
 
@@ -112,6 +167,7 @@ def on_message(client: mqtt.Client, userdata: Any, message: mqtt.MQTTMessage) ->
         parsed = json.loads(raw)
         event = TelemetryEnvelope.model_validate(parsed)
         store_event(message.topic, event)
+        update_live_state(client, event)
     except (UnicodeDecodeError, json.JSONDecodeError, ValidationError) as exc:
         client.publish(
             "caregrid/alerts/gateway",
@@ -166,7 +222,7 @@ def root() -> dict[str, Any]:
     return {
         "service": "CareGrid Raspberry Pi Gateway",
         "status": "running",
-        "version": "0.1.1",
+        "version": "0.2.0",
     }
 
 
@@ -174,12 +230,32 @@ def root() -> dict[str, Any]:
 def health() -> dict[str, Any]:
     with mqtt_lock:
         connected = mqtt_connected
+    with state_lock:
+        registered_devices = len(device_state)
+
     return {
         "status": "healthy" if connected else "degraded",
         "mqtt_connected": connected,
+        "registered_devices": registered_devices,
         "database": str(DB_PATH),
         "timestamp": utc_now(),
     }
+
+
+@app.get("/devices")
+def devices() -> dict[str, Any]:
+    with state_lock:
+        devices_snapshot = list(device_state.values())
+    return {"count": len(devices_snapshot), "devices": devices_snapshot}
+
+
+@app.get("/devices/{device_id}")
+def device(device_id: str) -> dict[str, Any]:
+    with state_lock:
+        item = device_state.get(device_id)
+    if item is None:
+        return {"found": False, "device_id": device_id}
+    return {"found": True, "device": item}
 
 
 @app.get("/events/recent")
