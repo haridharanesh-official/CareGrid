@@ -22,7 +22,7 @@ MQTT_USERNAME = os.getenv("CAREGRID_MQTT_USERNAME", "caregrid")
 MQTT_PASSWORD = os.getenv("CAREGRID_MQTT_PASSWORD", "")
 DB_PATH = Path(os.getenv("CAREGRID_DB_PATH", str(BASE_DIR / "data" / "caregrid.db")))
 
-app = FastAPI(title="CareGrid Raspberry Pi Gateway", version="0.2.0")
+app = FastAPI(title="CareGrid Raspberry Pi Gateway", version="0.2.1")
 
 mqtt_connected = False
 mqtt_lock = threading.Lock()
@@ -78,6 +78,42 @@ def store_event(topic: str, event: TelemetryEnvelope) -> None:
         conn.commit()
 
 
+def normalize_telemetry(payload: Any) -> tuple[TelemetryEnvelope, bool]:
+    """Normalize supported CareGrid telemetry formats.
+
+    Returns (event, gateway_discovery_allowed).
+
+    Supported formats:
+    1. Canonical CareGrid envelope:
+       {"device_id": "...", "node_type": "...", "data": {...}}
+    2. Native ESP32-S3 hospital ward payload where sensor groups such as
+       bed/ward/vitals/environment are top-level keys.
+
+    The ESP32 hospital ward firmware already publishes its own Home Assistant
+    discovery configuration, so gateway discovery is disabled for format 2 to
+    avoid duplicate entities.
+    """
+    if not isinstance(payload, dict):
+        raise ValueError("telemetry payload must be a JSON object")
+
+    if "data" in payload:
+        return TelemetryEnvelope.model_validate(payload), True
+
+    if "device_id" not in payload or "node_type" not in payload:
+        return TelemetryEnvelope.model_validate(payload), False
+
+    metadata_keys = {"device_id", "node_type", "timestamp"}
+    native_data = {key: value for key, value in payload.items() if key not in metadata_keys}
+
+    normalized = {
+        "device_id": payload["device_id"],
+        "node_type": payload["node_type"],
+        "timestamp": payload.get("timestamp"),
+        "data": native_data,
+    }
+    return TelemetryEnvelope.model_validate(normalized), False
+
+
 def discovery_component(value: Any) -> str:
     return "binary_sensor" if isinstance(value, bool) else "sensor"
 
@@ -86,7 +122,13 @@ def publish_home_assistant_discovery(client: mqtt.Client, event: TelemetryEnvelo
     state_topic = f"caregrid/state/{event.device_id}"
     availability_topic = f"caregrid/device/{event.device_id}/availability"
 
+    # Generic gateway discovery is intentionally limited to scalar values.
+    # Complex/nested devices such as the ESP32 hospital ward publish their own
+    # discovery config with precise templates and units.
     for key, value in event.data.items():
+        if isinstance(value, (dict, list)) or value is None:
+            continue
+
         component = discovery_component(value)
         object_id = f"caregrid_{event.device_id}_{key}".replace("-", "_")
         config_topic = f"homeassistant/{component}/{object_id}/config"
@@ -117,7 +159,12 @@ def publish_home_assistant_discovery(client: mqtt.Client, event: TelemetryEnvelo
     client.publish(state_topic, event.model_dump_json(), qos=1, retain=True)
 
 
-def update_live_state(client: mqtt.Client, event: TelemetryEnvelope) -> None:
+def update_live_state(
+    client: mqtt.Client,
+    event: TelemetryEnvelope,
+    *,
+    publish_discovery: bool,
+) -> None:
     state = {
         "device_id": event.device_id,
         "node_type": event.node_type,
@@ -128,7 +175,8 @@ def update_live_state(client: mqtt.Client, event: TelemetryEnvelope) -> None:
     with state_lock:
         device_state[event.device_id] = state
 
-    publish_home_assistant_discovery(client, event)
+    if publish_discovery:
+        publish_home_assistant_discovery(client, event)
 
 
 def on_connect(client: mqtt.Client, userdata: Any, flags: Any, reason_code: mqtt.ReasonCode, properties: Any = None) -> None:
@@ -165,10 +213,14 @@ def on_message(client: mqtt.Client, userdata: Any, message: mqtt.MQTTMessage) ->
     try:
         raw = message.payload.decode("utf-8")
         parsed = json.loads(raw)
-        event = TelemetryEnvelope.model_validate(parsed)
+        event, gateway_discovery_allowed = normalize_telemetry(parsed)
         store_event(message.topic, event)
-        update_live_state(client, event)
-    except (UnicodeDecodeError, json.JSONDecodeError, ValidationError) as exc:
+        update_live_state(
+            client,
+            event,
+            publish_discovery=gateway_discovery_allowed,
+        )
+    except (UnicodeDecodeError, json.JSONDecodeError, ValidationError, ValueError) as exc:
         client.publish(
             "caregrid/alerts/gateway",
             json.dumps(
@@ -222,7 +274,7 @@ def root() -> dict[str, Any]:
     return {
         "service": "CareGrid Raspberry Pi Gateway",
         "status": "running",
-        "version": "0.2.0",
+        "version": "0.2.1",
     }
 
 
