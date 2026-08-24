@@ -22,7 +22,7 @@ MQTT_USERNAME = os.getenv("CAREGRID_MQTT_USERNAME", "caregrid")
 MQTT_PASSWORD = os.getenv("CAREGRID_MQTT_PASSWORD", "")
 DB_PATH = Path(os.getenv("CAREGRID_DB_PATH", str(BASE_DIR / "data" / "caregrid.db")))
 
-app = FastAPI(title="CareGrid Raspberry Pi Gateway", version="0.1.0")
+app = FastAPI(title="CareGrid Raspberry Pi Gateway", version="0.1.1")
 
 mqtt_connected = False
 mqtt_lock = threading.Lock()
@@ -76,11 +76,13 @@ def store_event(topic: str, event: TelemetryEnvelope) -> None:
         conn.commit()
 
 
-def on_connect(client: mqtt.Client, userdata: Any, flags: Any, reason_code: Any, properties: Any = None) -> None:
+def on_connect(client: mqtt.Client, userdata: Any, flags: Any, reason_code: mqtt.ReasonCode, properties: Any = None) -> None:
     global mqtt_connected
-    if int(reason_code) == 0:
+
+    if not reason_code.is_failure:
         with mqtt_lock:
             mqtt_connected = True
+
         client.subscribe("caregrid/hospital/+/+/telemetry", qos=1)
         client.subscribe("caregrid/ambulance/+/telemetry", qos=1)
         client.publish(
@@ -92,12 +94,16 @@ def on_connect(client: mqtt.Client, userdata: Any, flags: Any, reason_code: Any,
     else:
         with mqtt_lock:
             mqtt_connected = False
+        print(f"MQTT connection failed: {reason_code}")
 
 
-def on_disconnect(client: mqtt.Client, userdata: Any, disconnect_flags: Any, reason_code: Any, properties: Any = None) -> None:
+def on_disconnect(client: mqtt.Client, userdata: Any, disconnect_flags: Any, reason_code: mqtt.ReasonCode, properties: Any = None) -> None:
     global mqtt_connected
     with mqtt_lock:
         mqtt_connected = False
+
+    if reason_code.is_failure:
+        print(f"MQTT disconnected unexpectedly: {reason_code}")
 
 
 def on_message(client: mqtt.Client, userdata: Any, message: mqtt.MQTTMessage) -> None:
@@ -160,7 +166,7 @@ def root() -> dict[str, Any]:
     return {
         "service": "CareGrid Raspberry Pi Gateway",
         "status": "running",
-        "version": "0.1.0",
+        "version": "0.1.1",
     }
 
 
