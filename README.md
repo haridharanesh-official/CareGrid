@@ -67,16 +67,26 @@ CareGrid/
 
 - [x] Repository initialized
 - [x] Raspberry Pi control-unit architecture defined
-- [ ] Raspberry Pi OS provisioning
-- [ ] Mosquitto MQTT broker configuration
-- [ ] CareGrid gateway service
+- [x] Raspberry Pi OS provisioning
+- [x] Mosquitto MQTT broker configuration
+- [x] CareGrid gateway service
 - [ ] Device registry and telemetry schema
 - [ ] Home Assistant MQTT discovery
 - [ ] Ambulance-to-hospital API
 - [ ] Alert engine
-- [ ] Persistent event logging
-- [ ] Service health monitoring
+- [x] Persistent event logging
+- [x] Service health monitoring
 - [ ] End-to-end integration tests
+
+## Verified Raspberry Pi Foundation
+
+- Raspberry Pi 4 running 64-bit Raspberry Pi OS on `aarch64`
+- Mosquitto enabled at boot with authenticated MQTT access
+- CareGrid gateway installed in `/opt/caregrid/raspberry-pi`
+- Gateway managed by `caregrid-gateway.service`
+- FastAPI reachable on port `8000`
+- Gateway health reports MQTT connectivity
+- SQLite event database initialized locally
 
 ## Project
 
