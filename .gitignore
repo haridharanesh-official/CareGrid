@@ -4,12 +4,24 @@ __pycache__/
 *.egg-info/
 .venv/
 
-# CareGrid secrets and runtime data
+# Secrets / environment
+.env
+.env.*
+!.env.example
 raspberry-pi/.env
+
+# CareGrid runtime data
 raspberry-pi/data/
+data/*.db
 *.db
 *.sqlite
 *.sqlite3
+
+# Frontend
+node_modules/
+.next/
+dist/
+build/
 
 # Editors / OS
 .vscode/
