@@ -16,21 +16,43 @@ from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, ValidationError
 
+
 BASE_DIR = Path(__file__).resolve().parents[1]
 load_dotenv(BASE_DIR / ".env")
+
 MQTT_HOST = os.getenv("CAREGRID_MQTT_HOST", "127.0.0.1")
 MQTT_PORT = int(os.getenv("CAREGRID_MQTT_PORT", "1883"))
 MQTT_USERNAME = os.getenv("CAREGRID_MQTT_USERNAME", "caregrid")
 MQTT_PASSWORD = os.getenv("CAREGRID_MQTT_PASSWORD", "")
-DB_PATH = Path(os.getenv("CAREGRID_DB_PATH", str(BASE_DIR / "data" / "caregrid.db")))
+DB_PATH = Path(
+    os.getenv(
+        "CAREGRID_DB_PATH",
+        str(BASE_DIR / "data" / "caregrid.db"),
+    )
+)
 
-app = FastAPI(title="CareGrid Raspberry Pi Gateway", version="0.3.0")
-app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_credentials=False, allow_methods=["*"], allow_headers=["*"])
+app = FastAPI(
+    title="CareGrid Raspberry Pi Gateway",
+    version="0.3.1",
+)
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=False,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
 
 mqtt_connected = False
 mqtt_lock = threading.Lock()
 state_lock = threading.Lock()
 device_state: dict[str, dict[str, Any]] = {}
+
+# ESP32 telemetry is currently published about every 5 seconds.
+DEVICE_STALE_SECONDS = 15
+DEVICE_OFFLINE_SECONDS = 30
 
 
 class TelemetryEnvelope(BaseModel):
@@ -44,78 +66,244 @@ def utc_now() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
+def parse_iso_time(value: str | None) -> datetime | None:
+    if not value:
+        return None
+
+    try:
+        dt = datetime.fromisoformat(
+            value.replace("Z", "+00:00")
+        )
+    except (TypeError, ValueError):
+        return None
+
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+
+    return dt.astimezone(timezone.utc)
+
+
+def device_connection_status(
+    state: dict[str, Any],
+) -> tuple[str, bool, float | None]:
+    """
+    Derive physical node availability from telemetry freshness.
+
+    LIVE    <= 15 seconds since telemetry
+    STALE   >15 and <=30 seconds
+    OFFLINE >30 seconds
+    """
+
+    last_seen = parse_iso_time(
+        state.get("last_seen")
+    )
+
+    if last_seen is None:
+        return "OFFLINE", False, None
+
+    age = max(
+        0.0,
+        (
+            datetime.now(timezone.utc)
+            - last_seen
+        ).total_seconds(),
+    )
+
+    if age <= DEVICE_STALE_SECONDS:
+        return "LIVE", True, age
+
+    if age <= DEVICE_OFFLINE_SECONDS:
+        return "STALE", False, age
+
+    return "OFFLINE", False, age
+
+
 def snapshot() -> dict[str, dict[str, Any]]:
     with state_lock:
-        return copy.deepcopy(device_state)
+        states = copy.deepcopy(device_state)
+
+    for state in states.values():
+        (
+            connection_status,
+            online,
+            age_seconds,
+        ) = device_connection_status(state)
+
+        state["online"] = online
+        state["connection_status"] = (
+            connection_status
+        )
+        state["age_seconds"] = (
+            round(age_seconds, 1)
+            if age_seconds is not None
+            else None
+        )
+
+    return states
 
 
 def topic_device_id(topic: str) -> str | None:
     parts = topic.split("/")
-    if len(parts) >= 5 and parts[0] == "caregrid" and parts[1] == "hospital" and parts[2] == "ward":
-        return f"hospital_{parts[3].replace('-', '_')}"
-    if len(parts) >= 4 and parts[0] == "caregrid" and parts[1] == "ambulance":
+
+    if (
+        len(parts) >= 5
+        and parts[0] == "caregrid"
+        and parts[1] == "hospital"
+        and parts[2] == "ward"
+    ):
+        return (
+            f"hospital_{parts[3].replace('-', '_')}"
+        )
+
+    if (
+        len(parts) >= 4
+        and parts[0] == "caregrid"
+        and parts[1] == "ambulance"
+    ):
         return parts[2]
+
     return None
 
 
 def init_db() -> None:
-    DB_PATH.parent.mkdir(parents=True, exist_ok=True)
-    with sqlite3.connect(DB_PATH) as conn:
-        conn.execute("""CREATE TABLE IF NOT EXISTS telemetry_events (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            received_at TEXT NOT NULL,
-            topic TEXT NOT NULL,
-            device_id TEXT NOT NULL,
-            node_type TEXT NOT NULL,
-            payload_json TEXT NOT NULL
-        )""")
-        conn.execute("""CREATE TABLE IF NOT EXISTS emergency_events (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            received_at TEXT NOT NULL,
-            topic TEXT NOT NULL,
-            device_id TEXT NOT NULL,
-            panic INTEGER NOT NULL,
-            status TEXT NOT NULL
-        )""")
-        conn.commit()
+    DB_PATH.parent.mkdir(
+        parents=True,
+        exist_ok=True,
+    )
 
-
-def store_telemetry(topic: str, event: TelemetryEnvelope) -> None:
     with sqlite3.connect(DB_PATH) as conn:
         conn.execute(
-            "INSERT INTO telemetry_events (received_at,topic,device_id,node_type,payload_json) VALUES (?,?,?,?,?)",
-            (utc_now(), topic, event.device_id, event.node_type, event.model_dump_json()),
+            """
+            CREATE TABLE IF NOT EXISTS telemetry_events (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                received_at TEXT NOT NULL,
+                topic TEXT NOT NULL,
+                device_id TEXT NOT NULL,
+                node_type TEXT NOT NULL,
+                payload_json TEXT NOT NULL
+            )
+            """
         )
+
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS emergency_events (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                received_at TEXT NOT NULL,
+                topic TEXT NOT NULL,
+                device_id TEXT NOT NULL,
+                panic INTEGER NOT NULL,
+                status TEXT NOT NULL
+            )
+            """
+        )
+
         conn.commit()
 
 
-def store_emergency(topic: str, device_id: str, panic: bool) -> None:
-    status = "PANIC" if panic else "NORMAL"
+def store_telemetry(
+    topic: str,
+    event: TelemetryEnvelope,
+) -> None:
     with sqlite3.connect(DB_PATH) as conn:
         conn.execute(
-            "INSERT INTO emergency_events (received_at,topic,device_id,panic,status) VALUES (?,?,?,?,?)",
-            (utc_now(), topic, device_id, 1 if panic else 0, status),
+            """
+            INSERT INTO telemetry_events
+                (received_at, topic, device_id, node_type, payload_json)
+            VALUES (?, ?, ?, ?, ?)
+            """,
+            (
+                utc_now(),
+                topic,
+                event.device_id,
+                event.node_type,
+                event.model_dump_json(),
+            ),
         )
+
         conn.commit()
 
 
-def normalize_telemetry(payload: Any) -> TelemetryEnvelope:
+def store_emergency(
+    topic: str,
+    device_id: str,
+    panic: bool,
+) -> None:
+    status = (
+        "PANIC"
+        if panic
+        else "NORMAL"
+    )
+
+    with sqlite3.connect(DB_PATH) as conn:
+        conn.execute(
+            """
+            INSERT INTO emergency_events
+                (received_at, topic, device_id, panic, status)
+            VALUES (?, ?, ?, ?, ?)
+            """,
+            (
+                utc_now(),
+                topic,
+                device_id,
+                1 if panic else 0,
+                status,
+            ),
+        )
+
+        conn.commit()
+
+
+def normalize_telemetry(
+    payload: Any,
+) -> TelemetryEnvelope:
     if not isinstance(payload, dict):
-        raise ValueError("telemetry payload must be a JSON object")
+        raise ValueError(
+            "telemetry payload must be a JSON object"
+        )
+
     if "data" in payload:
-        return TelemetryEnvelope.model_validate(payload)
-    if "device_id" not in payload or "node_type" not in payload:
-        return TelemetryEnvelope.model_validate(payload)
-    metadata = {"device_id", "node_type", "timestamp"}
-    return TelemetryEnvelope.model_validate({
-        "device_id": payload["device_id"],
-        "node_type": payload["node_type"],
-        "timestamp": payload.get("timestamp"),
-        "data": {k: v for k, v in payload.items() if k not in metadata},
-    })
+        return TelemetryEnvelope.model_validate(
+            payload
+        )
+
+    if (
+        "device_id" not in payload
+        or "node_type" not in payload
+    ):
+        return TelemetryEnvelope.model_validate(
+            payload
+        )
+
+    metadata = {
+        "device_id",
+        "node_type",
+        "timestamp",
+    }
+
+    return TelemetryEnvelope.model_validate(
+        {
+            "device_id": payload["device_id"],
+            "node_type": payload["node_type"],
+            "timestamp": payload.get("timestamp"),
+            "data": {
+                key: value
+                for key, value in payload.items()
+                if key not in metadata
+            },
+        }
+    )
 
 
-HA_ENTITIES: list[tuple[str, str, str, str, dict[str, Any]]] = [
+HA_ENTITIES: list[
+    tuple[
+        str,
+        str,
+        str,
+        str,
+        dict[str, Any],
+    ]
+] = [
     ("heart_rate", "Heart Rate", "sensor", "{{ value_json.data.vitals.heart_rate }}", {"unit_of_measurement": "bpm", "device_class": "heart_rate", "state_class": "measurement"}),
     ("spo2", "SpO2", "sensor", "{{ value_json.data.vitals.spo2 }}", {"unit_of_measurement": "%", "state_class": "measurement"}),
     ("vitals_valid", "Vitals Valid", "binary_sensor", "{{ 'ON' if value_json.data.vitals.valid else 'OFF' }}", {}),
@@ -142,13 +330,43 @@ HA_ENTITIES: list[tuple[str, str, str, str, dict[str, Any]]] = [
 ]
 
 
-def publish_home_assistant_discovery(client: mqtt.Client, event: TelemetryEnvelope) -> None:
-    state_topic = f"caregrid/state/{event.device_id}"
-    availability_topic = f"caregrid/device/{event.device_id}/availability"
-    device = {"identifiers": [f"caregrid_{event.device_id}"], "name": "CareGrid Smart Hospital Ward 01", "manufacturer": "CareGrid", "model": event.node_type}
-    for suffix, name, component, template, extra in HA_ENTITIES:
-        object_id = f"caregrid_{event.device_id}_{suffix}".replace("-", "_")
-        cfg: dict[str, Any] = {
+def publish_home_assistant_discovery(
+    client: mqtt.Client,
+    event: TelemetryEnvelope,
+) -> None:
+    state_topic = (
+        f"caregrid/state/{event.device_id}"
+    )
+
+    availability_topic = (
+        f"caregrid/device/"
+        f"{event.device_id}/availability"
+    )
+
+    device = {
+        "identifiers": [
+            f"caregrid_{event.device_id}"
+        ],
+        "name": (
+            "CareGrid Smart Hospital Ward 01"
+        ),
+        "manufacturer": "CareGrid",
+        "model": event.node_type,
+    }
+
+    for (
+        suffix,
+        name,
+        component,
+        template,
+        extra,
+    ) in HA_ENTITIES:
+        object_id = (
+            f"caregrid_{event.device_id}_{suffix}"
+            .replace("-", "_")
+        )
+
+        config: dict[str, Any] = {
             "name": name,
             "unique_id": object_id,
             "state_topic": state_topic,
@@ -156,114 +374,388 @@ def publish_home_assistant_discovery(client: mqtt.Client, event: TelemetryEnvelo
             "value_template": template,
             "device": device,
         }
+
         if component == "binary_sensor":
-            cfg.update({"payload_on": "ON", "payload_off": "OFF"})
-        cfg.update(extra)
-        client.publish(f"homeassistant/{component}/{object_id}/config", json.dumps(cfg), qos=1, retain=True)
-    client.publish(availability_topic, "online", qos=1, retain=True)
-    client.publish(state_topic, event.model_dump_json(), qos=1, retain=True)
+            config.update(
+                {
+                    "payload_on": "ON",
+                    "payload_off": "OFF",
+                }
+            )
+
+        config.update(extra)
+
+        client.publish(
+            f"homeassistant/{component}/"
+            f"{object_id}/config",
+            json.dumps(config),
+            qos=1,
+            retain=True,
+        )
+
+    client.publish(
+        availability_topic,
+        "online",
+        qos=1,
+        retain=True,
+    )
+
+    client.publish(
+        state_topic,
+        event.model_dump_json(),
+        qos=1,
+        retain=True,
+    )
 
 
-def update_telemetry_state(client: mqtt.Client, event: TelemetryEnvelope) -> None:
+def update_telemetry_state(
+    client: mqtt.Client,
+    event: TelemetryEnvelope,
+) -> None:
     with state_lock:
+        previous = device_state.get(
+            event.device_id,
+            {},
+        )
+
         device_state[event.device_id] = {
             "device_id": event.device_id,
             "node_type": event.node_type,
             "last_seen": utc_now(),
             "online": True,
+            "mqtt_status": previous.get(
+                "mqtt_status",
+                "online",
+            ),
+            "mqtt_status_updated_at": (
+                previous.get(
+                    "mqtt_status_updated_at"
+                )
+            ),
             "data": event.data,
         }
-    publish_home_assistant_discovery(client, event)
+
+    publish_home_assistant_discovery(
+        client,
+        event,
+    )
 
 
-def update_panic_state(device_id: str, panic: bool) -> None:
+def update_panic_state(
+    device_id: str,
+    panic: bool,
+) -> None:
+    """
+    Panic state is merged without refreshing last_seen.
+
+    Reason: /panic is retained. A retained NORMAL message received
+    after a gateway restart must not make a disconnected ward LIVE.
+    """
+
     with state_lock:
-        state = device_state.setdefault(device_id, {"device_id": device_id, "node_type": "smart_hospital_ward", "last_seen": utc_now(), "online": True, "data": {}})
-        state["last_seen"] = utc_now()
-        state["online"] = True
-        state.setdefault("data", {})["emergency"] = {"panic": panic, "status": "PANIC" if panic else "NORMAL", "updated_at": utc_now()}
+        state = device_state.setdefault(
+            device_id,
+            {
+                "device_id": device_id,
+                "node_type": (
+                    "smart_hospital_ward"
+                ),
+                "last_seen": None,
+                "online": False,
+                "data": {},
+            },
+        )
+
+        state.setdefault(
+            "data",
+            {},
+        )["emergency"] = {
+            "panic": panic,
+            "status": (
+                "PANIC"
+                if panic
+                else "NORMAL"
+            ),
+            "updated_at": utc_now(),
+        }
 
 
-def update_online_state(device_id: str, online: bool) -> None:
+def update_online_state(
+    device_id: str,
+    online: bool,
+) -> None:
+    """
+    Record ESP32 MQTT/LWT state separately.
+
+    A retained 'online' message is not proof of current physical
+    connectivity, so it does not refresh last_seen.
+    """
+
     with state_lock:
-        state = device_state.setdefault(device_id, {"device_id": device_id, "node_type": "smart_hospital_ward", "last_seen": utc_now(), "online": online, "data": {}})
-        state["online"] = online
-        state["last_seen"] = utc_now()
+        state = device_state.setdefault(
+            device_id,
+            {
+                "device_id": device_id,
+                "node_type": (
+                    "smart_hospital_ward"
+                ),
+                "last_seen": None,
+                "online": False,
+                "data": {},
+            },
+        )
+
+        state["mqtt_status"] = (
+            "online"
+            if online
+            else "offline"
+        )
+
+        state["mqtt_status_updated_at"] = (
+            utc_now()
+        )
+
+        if not online:
+            state["online"] = False
 
 
-def on_connect(client: mqtt.Client, userdata: Any, flags: Any, reason_code: mqtt.ReasonCode, properties: Any = None) -> None:
+def on_connect(
+    client: mqtt.Client,
+    userdata: Any,
+    flags: Any,
+    reason_code: mqtt.ReasonCode,
+    properties: Any = None,
+) -> None:
     global mqtt_connected
+
     if reason_code.is_failure:
         with mqtt_lock:
             mqtt_connected = False
-        print(f"[MQTT] Connection failed: {reason_code}")
+
+        print(
+            f"[MQTT] Connection failed: "
+            f"{reason_code}"
+        )
         return
+
     with mqtt_lock:
         mqtt_connected = True
+
     for topic in (
         "caregrid/hospital/+/+/telemetry",
         "caregrid/hospital/+/+/panic",
         "caregrid/hospital/+/+/status",
         "caregrid/ambulance/+/telemetry",
     ):
-        client.subscribe(topic, qos=1)
-    client.publish("caregrid/system/raspberry-pi/status", json.dumps({"status": "online", "timestamp": utc_now()}), qos=1, retain=True)
-    print(f"[MQTT] Connected to broker {MQTT_HOST}:{MQTT_PORT}")
+        client.subscribe(
+            topic,
+            qos=1,
+        )
+
+    client.publish(
+        "caregrid/system/raspberry-pi/status",
+        json.dumps(
+            {
+                "status": "online",
+                "timestamp": utc_now(),
+            }
+        ),
+        qos=1,
+        retain=True,
+    )
+
+    print(
+        "[MQTT] Connected to broker "
+        f"{MQTT_HOST}:{MQTT_PORT}"
+    )
 
 
-def on_disconnect(client: mqtt.Client, userdata: Any, disconnect_flags: Any, reason_code: mqtt.ReasonCode, properties: Any = None) -> None:
+def on_disconnect(
+    client: mqtt.Client,
+    userdata: Any,
+    disconnect_flags: Any,
+    reason_code: mqtt.ReasonCode,
+    properties: Any = None,
+) -> None:
     global mqtt_connected
+
     with mqtt_lock:
         mqtt_connected = False
+
     if reason_code.is_failure:
-        print(f"[MQTT] Disconnected unexpectedly: {reason_code}")
+        print(
+            "[MQTT] Disconnected unexpectedly: "
+            f"{reason_code}"
+        )
 
 
-def on_message(client: mqtt.Client, userdata: Any, message: mqtt.MQTTMessage) -> None:
+def on_message(
+    client: mqtt.Client,
+    userdata: Any,
+    message: mqtt.MQTTMessage,
+) -> None:
     topic = message.topic
+
     try:
-        raw = message.payload.decode("utf-8")
+        raw = message.payload.decode(
+            "utf-8"
+        )
     except UnicodeDecodeError as exc:
-        print(f"[MQTT] Invalid UTF-8 on {topic}: {exc}")
+        print(
+            f"[MQTT] Invalid UTF-8 "
+            f"on {topic}: {exc}"
+        )
         return
 
     if topic.endswith("/panic"):
-        device_id = topic_device_id(topic) or "hospital_ward_01"
+        device_id = (
+            topic_device_id(topic)
+            or "hospital_ward_01"
+        )
+
         value = raw.strip().upper()
-        if value not in {"EMERGENCY", "NORMAL"}:
-            print(f"[PANIC] Ignoring unknown payload on {topic}: {raw!r}")
+
+        if value not in {
+            "EMERGENCY",
+            "NORMAL",
+        }:
+            print(
+                "[PANIC] Ignoring unknown payload "
+                f"on {topic}: {raw!r}"
+            )
             return
-        panic = value == "EMERGENCY"
-        update_panic_state(device_id, panic)
-        store_emergency(topic, device_id, panic)
+
+        panic = (
+            value == "EMERGENCY"
+        )
+
+        update_panic_state(
+            device_id,
+            panic,
+        )
+
+        store_emergency(
+            topic,
+            device_id,
+            panic,
+        )
+
         if panic:
-            client.publish("caregrid/alerts/emergency", json.dumps({"type": "patient_panic", "device_id": device_id, "status": "PANIC", "timestamp": utc_now()}), qos=1)
-            print(f"[PANIC] EMERGENCY ACTIVE: {device_id}")
+            client.publish(
+                "caregrid/alerts/emergency",
+                json.dumps(
+                    {
+                        "type": "patient_panic",
+                        "device_id": device_id,
+                        "status": "PANIC",
+                        "timestamp": utc_now(),
+                    }
+                ),
+                qos=1,
+            )
+
+            print(
+                "[PANIC] EMERGENCY ACTIVE: "
+                f"{device_id}"
+            )
         else:
-            print(f"[PANIC] CLEARED: {device_id}")
+            print(
+                f"[PANIC] CLEARED: "
+                f"{device_id}"
+            )
+
         return
 
     if topic.endswith("/status"):
-        device_id = topic_device_id(topic)
+        device_id = topic_device_id(
+            topic
+        )
+
         value = raw.strip().lower()
-        if device_id and value in {"online", "offline"}:
-            update_online_state(device_id, value == "online")
-            print(f"[STATUS] {device_id}: {value}")
+
+        if (
+            device_id
+            and value in {
+                "online",
+                "offline",
+            }
+        ):
+            update_online_state(
+                device_id,
+                value == "online",
+            )
+
+            print(
+                f"[STATUS] {device_id}: "
+                f"{value}"
+            )
+
         return
 
     if topic.endswith("/telemetry"):
         try:
-            event = normalize_telemetry(json.loads(raw))
-            store_telemetry(topic, event)
-            update_telemetry_state(client, event)
-        except (json.JSONDecodeError, ValidationError, ValueError) as exc:
-            print(f"[MQTT] Invalid telemetry on {topic}: {exc}")
-            client.publish("caregrid/alerts/gateway", json.dumps({"type": "invalid_telemetry", "topic": topic, "error": str(exc), "timestamp": utc_now()}), qos=1)
+            event = normalize_telemetry(
+                json.loads(raw)
+            )
+
+            store_telemetry(
+                topic,
+                event,
+            )
+
+            update_telemetry_state(
+                client,
+                event,
+            )
+
+        except (
+            json.JSONDecodeError,
+            ValidationError,
+            ValueError,
+        ) as exc:
+            print(
+                "[MQTT] Invalid telemetry "
+                f"on {topic}: {exc}"
+            )
+
+            client.publish(
+                "caregrid/alerts/gateway",
+                json.dumps(
+                    {
+                        "type": (
+                            "invalid_telemetry"
+                        ),
+                        "topic": topic,
+                        "error": str(exc),
+                        "timestamp": utc_now(),
+                    }
+                ),
+                qos=1,
+            )
 
 
-mqtt_client = mqtt.Client(mqtt.CallbackAPIVersion.VERSION2, client_id="caregrid-pi-gateway")
-mqtt_client.username_pw_set(MQTT_USERNAME, MQTT_PASSWORD)
-mqtt_client.will_set("caregrid/system/raspberry-pi/status", json.dumps({"status": "offline", "timestamp": utc_now()}), qos=1, retain=True)
+mqtt_client = mqtt.Client(
+    mqtt.CallbackAPIVersion.VERSION2,
+    client_id="caregrid-pi-gateway",
+)
+
+mqtt_client.username_pw_set(
+    MQTT_USERNAME,
+    MQTT_PASSWORD,
+)
+
+mqtt_client.will_set(
+    "caregrid/system/raspberry-pi/status",
+    json.dumps(
+        {
+            "status": "offline",
+            "timestamp": utc_now(),
+        }
+    ),
+    qos=1,
+    retain=True,
+)
+
 mqtt_client.on_connect = on_connect
 mqtt_client.on_disconnect = on_disconnect
 mqtt_client.on_message = on_message
@@ -272,98 +764,290 @@ mqtt_client.on_message = on_message
 @app.on_event("startup")
 def startup() -> None:
     init_db()
-    mqtt_client.connect_async(MQTT_HOST, MQTT_PORT, keepalive=60)
+
+    mqtt_client.connect_async(
+        MQTT_HOST,
+        MQTT_PORT,
+        keepalive=60,
+    )
+
     mqtt_client.loop_start()
-    print("[CAREGRID] Raspberry Pi gateway starting")
+
+    print(
+        "[CAREGRID] Raspberry Pi gateway starting"
+    )
 
 
 @app.on_event("shutdown")
 def shutdown() -> None:
     try:
-        mqtt_client.publish("caregrid/system/raspberry-pi/status", json.dumps({"status": "offline", "timestamp": utc_now()}), qos=1, retain=True)
+        mqtt_client.publish(
+            "caregrid/system/raspberry-pi/status",
+            json.dumps(
+                {
+                    "status": "offline",
+                    "timestamp": utc_now(),
+                }
+            ),
+            qos=1,
+            retain=True,
+        )
+
         mqtt_client.disconnect()
+
     finally:
         mqtt_client.loop_stop()
 
 
 @app.get("/")
 def root() -> dict[str, Any]:
-    return {"service": "CareGrid Raspberry Pi Gateway", "status": "running", "version": "0.3.0", "realtime_api": "/api/hospital/latest", "websocket": "/ws/hospital"}
+    return {
+        "service": (
+            "CareGrid Raspberry Pi Gateway"
+        ),
+        "status": "running",
+        "version": "0.3.1",
+        "realtime_api": (
+            "/api/hospital/latest"
+        ),
+        "websocket": "/ws/hospital",
+        "freshness": {
+            "live_seconds": (
+                DEVICE_STALE_SECONDS
+            ),
+            "offline_seconds": (
+                DEVICE_OFFLINE_SECONDS
+            ),
+        },
+    }
 
 
 @app.get("/health")
 def health() -> dict[str, Any]:
     with mqtt_lock:
         connected = mqtt_connected
+
     with state_lock:
-        registered = len(device_state)
-    return {"status": "healthy" if connected else "degraded", "mqtt_connected": connected, "registered_devices": registered, "database": str(DB_PATH), "timestamp": utc_now()}
+        registered = len(
+            device_state
+        )
+
+    return {
+        "status": (
+            "healthy"
+            if connected
+            else "degraded"
+        ),
+        "mqtt_connected": connected,
+        "registered_devices": registered,
+        "database": str(DB_PATH),
+        "timestamp": utc_now(),
+    }
 
 
 @app.get("/devices")
 def devices() -> dict[str, Any]:
-    states = list(snapshot().values())
-    return {"count": len(states), "devices": states}
+    states = list(
+        snapshot().values()
+    )
+
+    return {
+        "count": len(states),
+        "devices": states,
+    }
 
 
 @app.get("/devices/{device_id}")
-def device(device_id: str) -> dict[str, Any]:
-    item = snapshot().get(device_id)
-    return {"found": item is not None, "device_id": device_id} if item is None else {"found": True, "device": item}
+def device(
+    device_id: str,
+) -> dict[str, Any]:
+    item = snapshot().get(
+        device_id
+    )
+
+    if item is None:
+        return {
+            "found": False,
+            "device_id": device_id,
+        }
+
+    return {
+        "found": True,
+        "device": item,
+    }
 
 
 def hospital_nodes() -> dict[str, dict[str, Any]]:
-    return {k: v for k, v in snapshot().items() if str(v.get("node_type", "")).startswith("smart_hospital") or k.startswith("hospital_")}
+    return {
+        key: value
+        for key, value
+        in snapshot().items()
+        if (
+            str(
+                value.get(
+                    "node_type",
+                    "",
+                )
+            ).startswith(
+                "smart_hospital"
+            )
+            or key.startswith(
+                "hospital_"
+            )
+        )
+    }
 
 
 @app.get("/api/hospital/latest")
 def hospital_latest() -> dict[str, Any]:
-    return {"status": "ok", "timestamp": utc_now(), "nodes": hospital_nodes()}
+    return {
+        "status": "ok",
+        "timestamp": utc_now(),
+        "nodes": hospital_nodes(),
+    }
 
 
-@app.get("/api/hospital/{device_id}")
-def hospital_device(device_id: str) -> dict[str, Any]:
-    item = snapshot().get(device_id)
-    return {"found": False, "device_id": device_id} if item is None else {"found": True, "device": item, "timestamp": utc_now()}
+@app.get(
+    "/api/hospital/{device_id}"
+)
+def hospital_device(
+    device_id: str,
+) -> dict[str, Any]:
+    item = snapshot().get(
+        device_id
+    )
+
+    if item is None:
+        return {
+            "found": False,
+            "device_id": device_id,
+        }
+
+    return {
+        "found": True,
+        "device": item,
+        "timestamp": utc_now(),
+    }
 
 
 @app.websocket("/ws/hospital")
-async def hospital_websocket(websocket: WebSocket) -> None:
+async def hospital_websocket(
+    websocket: WebSocket,
+) -> None:
     await websocket.accept()
-    print("[WS] Hospital frontend connected")
+
+    print(
+        "[WS] Hospital frontend connected"
+    )
+
     try:
         while True:
-            await websocket.send_json({"type": "hospital_update", "timestamp": utc_now(), "nodes": hospital_nodes()})
+            await websocket.send_json(
+                {
+                    "type": "hospital_update",
+                    "timestamp": utc_now(),
+                    "nodes": hospital_nodes(),
+                }
+            )
+
             await asyncio.sleep(1)
+
     except WebSocketDisconnect:
-        print("[WS] Hospital frontend disconnected")
+        print(
+            "[WS] Hospital frontend disconnected"
+        )
+
     except Exception as exc:
-        print(f"[WS] Connection error: {exc}")
+        print(
+            f"[WS] Connection error: {exc}"
+        )
 
 
 @app.get("/events/recent")
-def recent_events(limit: int = 20) -> dict[str, Any]:
-    safe = max(1, min(limit, 100))
+def recent_events(
+    limit: int = 20,
+) -> dict[str, Any]:
+    safe = max(
+        1,
+        min(limit, 100),
+    )
+
     with sqlite3.connect(DB_PATH) as conn:
         conn.row_factory = sqlite3.Row
-        rows = conn.execute("SELECT id,received_at,topic,device_id,node_type,payload_json FROM telemetry_events ORDER BY id DESC LIMIT ?", (safe,)).fetchall()
+
+        rows = conn.execute(
+            """
+            SELECT
+                id,
+                received_at,
+                topic,
+                device_id,
+                node_type,
+                payload_json
+            FROM telemetry_events
+            ORDER BY id DESC
+            LIMIT ?
+            """,
+            (safe,),
+        ).fetchall()
+
     events = []
+
     for row in rows:
         item = dict(row)
-        item["payload"] = json.loads(item.pop("payload_json"))
+
+        item["payload"] = json.loads(
+            item.pop("payload_json")
+        )
+
         events.append(item)
-    return {"count": len(events), "events": events}
+
+    return {
+        "count": len(events),
+        "events": events,
+    }
 
 
 @app.get("/api/emergencies/recent")
-def recent_emergencies(limit: int = 20) -> dict[str, Any]:
-    safe = max(1, min(limit, 100))
+def recent_emergencies(
+    limit: int = 20,
+) -> dict[str, Any]:
+    safe = max(
+        1,
+        min(limit, 100),
+    )
+
     with sqlite3.connect(DB_PATH) as conn:
         conn.row_factory = sqlite3.Row
-        rows = conn.execute("SELECT id,received_at,topic,device_id,panic,status FROM emergency_events ORDER BY id DESC LIMIT ?", (safe,)).fetchall()
+
+        rows = conn.execute(
+            """
+            SELECT
+                id,
+                received_at,
+                topic,
+                device_id,
+                panic,
+                status
+            FROM emergency_events
+            ORDER BY id DESC
+            LIMIT ?
+            """,
+            (safe,),
+        ).fetchall()
+
     events = []
+
     for row in rows:
         item = dict(row)
-        item["panic"] = bool(item["panic"])
+
+        item["panic"] = bool(
+            item["panic"]
+        )
+
         events.append(item)
-    return {"count": len(events), "events": events}
+
+    return {
+        "count": len(events),
+        "events": events,
+    }
