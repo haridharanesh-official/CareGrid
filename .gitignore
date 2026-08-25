@@ -8,6 +8,7 @@ __pycache__/
 .env
 .env.*
 !.env.example
+!.env.local.example
 raspberry-pi/.env
 
 # CareGrid runtime data

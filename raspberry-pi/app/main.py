@@ -16,6 +16,8 @@ from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, ValidationError
 
+from .hospital_data import hospital_router, init_hospital_db, seed_demo_data
+
 BASE_DIR = Path(__file__).resolve().parents[1]
 load_dotenv(BASE_DIR / ".env")
 MQTT_HOST = os.getenv("CAREGRID_MQTT_HOST", "127.0.0.1")
@@ -26,6 +28,7 @@ DB_PATH = Path(os.getenv("CAREGRID_DB_PATH", str(BASE_DIR / "data" / "caregrid.d
 
 app = FastAPI(title="CareGrid Raspberry Pi Gateway", version="0.3.0")
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_credentials=False, allow_methods=["*"], allow_headers=["*"])
+app.include_router(hospital_router)
 
 mqtt_connected = False
 mqtt_lock = threading.Lock()
@@ -47,6 +50,38 @@ def utc_now() -> str:
 def snapshot() -> dict[str, dict[str, Any]]:
     with state_lock:
         return copy.deepcopy(device_state)
+
+
+def node_freshness(item: dict[str, Any], now: datetime | None = None) -> dict[str, Any]:
+    """Expose physical-node liveness using telemetry time only.
+
+    Retained MQTT status and panic messages deliberately do not participate in
+    this calculation; an unplugged ESP32 must age to STALE and then OFFLINE.
+    """
+    current = now or datetime.now(timezone.utc)
+    last_seen = item.get("last_seen")
+    age_seconds: float | None = None
+    if last_seen:
+        try:
+            received = datetime.fromisoformat(str(last_seen).replace("Z", "+00:00"))
+            if received.tzinfo is None:
+                received = received.replace(tzinfo=timezone.utc)
+            age_seconds = max(0.0, (current - received).total_seconds())
+        except ValueError:
+            age_seconds = None
+
+    if age_seconds is None or age_seconds > 30:
+        connection_status = "OFFLINE"
+    elif age_seconds > 15:
+        connection_status = "STALE"
+    else:
+        connection_status = "LIVE"
+
+    result = copy.deepcopy(item)
+    result["age_seconds"] = round(age_seconds, 1) if age_seconds is not None else None
+    result["connection_status"] = connection_status
+    result["online"] = connection_status == "LIVE"
+    return result
 
 
 def topic_device_id(topic: str) -> str | None:
@@ -178,17 +213,21 @@ def update_telemetry_state(client: mqtt.Client, event: TelemetryEnvelope) -> Non
 
 def update_panic_state(device_id: str, panic: bool) -> None:
     with state_lock:
-        state = device_state.setdefault(device_id, {"device_id": device_id, "node_type": "smart_hospital_ward", "last_seen": utc_now(), "online": True, "data": {}})
-        state["last_seen"] = utc_now()
-        state["online"] = True
+        state = device_state.setdefault(device_id, {"device_id": device_id, "node_type": "smart_hospital_ward", "last_seen": None, "data": {}})
         state.setdefault("data", {})["emergency"] = {"panic": panic, "status": "PANIC" if panic else "NORMAL", "updated_at": utc_now()}
 
 
 def update_online_state(device_id: str, online: bool) -> None:
     with state_lock:
-        state = device_state.setdefault(device_id, {"device_id": device_id, "node_type": "smart_hospital_ward", "last_seen": utc_now(), "online": online, "data": {}})
-        state["online"] = online
-        state["last_seen"] = utc_now()
+        state = device_state.setdefault(device_id, {"device_id": device_id, "node_type": "smart_hospital_ward", "last_seen": None, "data": {}})
+        state["reported_status"] = "online" if online else "offline"
+        state["status_reported_at"] = utc_now()
+
+
+def update_rfid_state(device_id: str, uid: str) -> None:
+    with state_lock:
+        state = device_state.setdefault(device_id, {"device_id": device_id, "node_type": "smart_hospital_ward", "last_seen": None, "data": {}})
+        state.setdefault("data", {})["rfid"] = {"last_uid": uid, "updated_at": utc_now()}
 
 
 def on_connect(client: mqtt.Client, userdata: Any, flags: Any, reason_code: mqtt.ReasonCode, properties: Any = None) -> None:
@@ -204,6 +243,7 @@ def on_connect(client: mqtt.Client, userdata: Any, flags: Any, reason_code: mqtt
         "caregrid/hospital/+/+/telemetry",
         "caregrid/hospital/+/+/panic",
         "caregrid/hospital/+/+/status",
+        "caregrid/hospital/+/+/rfid",
         "caregrid/ambulance/+/telemetry",
     ):
         client.subscribe(topic, qos=1)
@@ -251,6 +291,18 @@ def on_message(client: mqtt.Client, userdata: Any, message: mqtt.MQTTMessage) ->
             print(f"[STATUS] {device_id}: {value}")
         return
 
+    if topic.endswith("/rfid"):
+        device_id = topic_device_id(topic) or "hospital_ward_01"
+        try:
+            decoded = json.loads(raw)
+            uid = str(decoded.get("uid") or decoded.get("last_uid") or "").strip().upper() if isinstance(decoded, dict) else str(decoded).strip().upper()
+        except json.JSONDecodeError:
+            uid = raw.strip().upper()
+        if uid and uid != "NONE":
+            update_rfid_state(device_id, uid)
+            print(f"[RFID] {device_id}: {uid}")
+        return
+
     if topic.endswith("/telemetry"):
         try:
             event = normalize_telemetry(json.loads(raw))
@@ -272,6 +324,8 @@ mqtt_client.on_message = on_message
 @app.on_event("startup")
 def startup() -> None:
     init_db()
+    init_hospital_db()
+    seed_demo_data()
     mqtt_client.connect_async(MQTT_HOST, MQTT_PORT, keepalive=60)
     mqtt_client.loop_start()
     print("[CAREGRID] Raspberry Pi gateway starting")
@@ -302,29 +356,35 @@ def health() -> dict[str, Any]:
 
 @app.get("/devices")
 def devices() -> dict[str, Any]:
-    states = list(snapshot().values())
+    states = [node_freshness(item) for item in snapshot().values()]
     return {"count": len(states), "devices": states}
 
 
 @app.get("/devices/{device_id}")
 def device(device_id: str) -> dict[str, Any]:
     item = snapshot().get(device_id)
-    return {"found": item is not None, "device_id": device_id} if item is None else {"found": True, "device": item}
+    return {"found": item is not None, "device_id": device_id} if item is None else {"found": True, "device": node_freshness(item)}
 
 
 def hospital_nodes() -> dict[str, dict[str, Any]]:
-    return {k: v for k, v in snapshot().items() if str(v.get("node_type", "")).startswith("smart_hospital") or k.startswith("hospital_")}
+    return {k: node_freshness(v) for k, v in snapshot().items() if str(v.get("node_type", "")).startswith("smart_hospital") or k.startswith("hospital_")}
+
+
+def gateway_snapshot() -> dict[str, Any]:
+    with mqtt_lock:
+        connected = mqtt_connected
+    return {"status": "LIVE" if connected else "OFFLINE", "mqtt_connected": connected, "timestamp": utc_now()}
 
 
 @app.get("/api/hospital/latest")
 def hospital_latest() -> dict[str, Any]:
-    return {"status": "ok", "timestamp": utc_now(), "nodes": hospital_nodes()}
+    return {"status": "ok", "timestamp": utc_now(), "gateway": gateway_snapshot(), "nodes": hospital_nodes()}
 
 
 @app.get("/api/hospital/{device_id}")
 def hospital_device(device_id: str) -> dict[str, Any]:
     item = snapshot().get(device_id)
-    return {"found": False, "device_id": device_id} if item is None else {"found": True, "device": item, "timestamp": utc_now()}
+    return {"found": False, "device_id": device_id} if item is None else {"found": True, "device": node_freshness(item), "timestamp": utc_now()}
 
 
 @app.websocket("/ws/hospital")
@@ -333,7 +393,7 @@ async def hospital_websocket(websocket: WebSocket) -> None:
     print("[WS] Hospital frontend connected")
     try:
         while True:
-            await websocket.send_json({"type": "hospital_update", "timestamp": utc_now(), "nodes": hospital_nodes()})
+            await websocket.send_json({"type": "hospital_update", "timestamp": utc_now(), "gateway": gateway_snapshot(), "nodes": hospital_nodes()})
             await asyncio.sleep(1)
     except WebSocketDisconnect:
         print("[WS] Hospital frontend disconnected")

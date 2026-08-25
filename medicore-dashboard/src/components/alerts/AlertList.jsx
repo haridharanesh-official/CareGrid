@@ -1,0 +1,5 @@
+import { CheckCircle, Warning, Info, Siren } from "@phosphor-icons/react";
+import { useCareGrid } from "../../app/providers.jsx";
+import { Badge, Button } from "../common/ui.jsx";
+
+export function AlertList({limit,showAcknowledged=true,onAction}){const {alerts,acknowledgeAlert}=useCareGrid();const visible=alerts.filter(a=>showAcknowledged||!a.acknowledged).slice(0,limit||alerts.length);if(!visible.length)return <div className="cg-empty"><CheckCircle/>No active alerts</div>;return <div className="cg-alert-list">{visible.map(a=>{const Icon=a.severity==="critical"?Siren:a.severity==="warning"?Warning:Info;return <article key={a.id} className={`cg-alert ${a.severity} ${a.acknowledged?"ack":""}`}><Icon weight="duotone"/><div><header><b>{a.message}</b><Badge tone={a.severity}>{a.severity}</Badge></header><p>{a.source} · {a.timestamp}</p><footer>{onAction&&<Button onClick={()=>onAction(a)}>{a.action}</Button>}{!a.acknowledged&&<Button variant="ghost" onClick={()=>acknowledgeAlert(a.id)}>Acknowledge</Button>}{a.acknowledged&&<span><CheckCircle/> Acknowledged</span>}</footer></div></article>})}</div>}

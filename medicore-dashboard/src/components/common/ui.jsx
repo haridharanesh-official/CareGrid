@@ -1,0 +1,11 @@
+import { ArrowClockwise, Check, Warning, X } from "@phosphor-icons/react";
+
+export function Card({title,action,children,className=""}){return <section className={`cg-card ${className}`}><header className="cg-card-head"><h2>{title}</h2>{action}</header>{children}</section>}
+export function Badge({tone="info",children,source}){return <span className={`cg-badge ${tone}`}>{children}{source==="demo"&&<small>Demo Data</small>}</span>}
+export function Button({variant="secondary",icon:Icon,children,...props}){return <button className={`cg-button ${variant}`} {...props}>{Icon&&<Icon weight="bold"/>}{children}</button>}
+export function Metric({icon:Icon,label,value,detail,tone="blue"}){return <div className={`cg-metric ${tone}`}>{Icon&&<span><Icon weight="duotone"/></span>}<div><small>{label}</small><strong>{value}</strong>{detail&&<em>{detail}</em>}</div></div>}
+export function PageHeader({title,subtitle,actions,eyebrow}){return <div className="cg-page-header"><div>{eyebrow&&<span>{eyebrow}</span>}<h1>{title}</h1><p>{subtitle}</p></div>{actions&&<div className="cg-page-actions">{actions}</div>}</div>}
+export function DataState({status,error,onRetry,children}){if(status==="loading")return <div className="cg-state"><div className="cg-skeleton"/><div className="cg-skeleton short"/><p>Connecting to CareGrid Gateway…</p></div>;if(status==="offline")return <div className="cg-state error"><Warning/><h2>CareGrid Gateway Offline</h2><p>{error||"Live telemetry is unavailable."}</p><Button icon={ArrowClockwise} onClick={onRetry}>Retry</Button></div>;return children}
+export function Modal({title,children,onClose,footer}){return <div className="cg-modal-backdrop" onMouseDown={onClose}><div className="cg-modal" role="dialog" aria-modal="true" aria-label={title} onMouseDown={e=>e.stopPropagation()}><header><h2>{title}</h2><button aria-label="Close" onClick={onClose}><X/></button></header><div className="cg-modal-body">{children}</div>{footer&&<footer>{footer}</footer>}</div></div>}
+export function SuccessNotice({children}){return <div className="cg-success"><Check weight="bold"/>{children}</div>}
+export const formatUptime=ms=>{const total=Math.floor((ms||0)/1000),h=Math.floor(total/3600),m=Math.floor((total%3600)/60);return `${h}h ${m}m`;};

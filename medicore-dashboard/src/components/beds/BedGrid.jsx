@@ -1,0 +1,4 @@
+import { Bed, Broadcast, Broom, Lock, User } from "@phosphor-icons/react";
+import { Badge, Button } from "../common/ui.jsx";
+
+export function BedGrid({beds,onSelect,actionLabel="Manage"}){if(!beds?.length)return <div className="cg-empty"><Bed/>No beds available</div>;return <div className="cg-bed-grid">{beds.map(b=><article className={`cg-bed ${b.occupied?"occupied":"free"}`} key={b.id}><header><span><Bed weight="duotone"/><b>{b.id}</b></span><Badge tone={b.occupied?"warning":b.reserved?"info":"healthy"}>{b.occupied?"Occupied":b.reserved?"Reserved":"Free"}</Badge></header><p>{b.type} · {b.ward}</p><div className="cg-bed-details"><span><User/>{b.patient||"No patient"}</span><span><Broadcast/>{b.sensor==="live"?"Live bed sensor":"Demo/backend bed"}</span><span><Broom/>{b.cleaning}</span>{b.incoming&&<span><Lock/>Incoming {b.incoming}</span>}</div>{onSelect&&<Button onClick={()=>onSelect(b)}>{actionLabel}</Button>}</article>)}</div>}

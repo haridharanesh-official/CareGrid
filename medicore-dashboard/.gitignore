@@ -1,0 +1,11 @@
+node_modules/
+dist/
+dist-check/
+.env
+.env.local
+.env.*.local
+*.log
+comparison-*.png
+implementation-*.png
+reference-assets/
+public/assets/doctor-hero.png

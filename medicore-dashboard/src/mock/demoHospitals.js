@@ -1,0 +1,6 @@
+export const demoHospitals = [
+  { id:"h1", name:"CityCare Multi-Speciality Hospital", distance:3.8, eta:8, emergencyBeds:4, icuBeds:2, generalBeds:18, department:"Cardiology", medicine:true, load:42, connected:true, reservable:true, score:94, reason:"Fastest suitable hospital with emergency bed, ICU capacity and required medicine." },
+  { id:"h2", name:"Northside General Hospital", distance:2.4, eta:6, emergencyBeds:0, icuBeds:0, generalBeds:7, department:"Emergency Medicine", medicine:true, load:96, connected:true, reservable:false, score:61, reason:"Nearest hospital, but emergency and ICU beds are currently full." },
+  { id:"h3", name:"St. Anne Care Centre", distance:5.1, eta:11, emergencyBeds:3, icuBeds:1, generalBeds:12, department:"Trauma", medicine:false, load:58, connected:true, reservable:true, score:76, reason:"Beds and trauma team available; requested medicine is unavailable locally." },
+  { id:"h4", name:"Riverside Community Hospital", distance:6.7, eta:14, emergencyBeds:2, icuBeds:1, generalBeds:22, department:"General Medicine", medicine:true, load:35, connected:false, reservable:false, score:69, reason:"Capacity available, but CareGrid connectivity is temporarily degraded." },
+];

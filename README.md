@@ -128,9 +128,45 @@ GET /api/emergencies/recent
 WS  /ws/hospital
 ```
 
+The demo hospital domain is SQLite-backed and adds:
+
+```text
+GET   /api/patients
+GET   /api/patients/{patient_id}
+GET   /api/patients/{patient_id}/events
+GET   /api/rfid/{uid}
+GET   /api/hospitals
+GET   /api/hospitals/{hospital_id}
+GET   /api/hospitals/{hospital_id}/beds
+GET   /api/hospitals/{hospital_id}/departments
+GET   /api/hospitals/recommend
+GET   /api/pharmacy/search
+GET   /api/hospitals/{hospital_id}/pharmacy
+POST  /api/emergency-cases
+POST  /api/prealerts
+GET   /api/prealerts
+GET   /api/prealerts/{id}
+```
+
+Hospital, patient, RFID and pharmacy seed records are hackathon demo data. Seed initialization is idempotent; the runtime SQLite database is not committed.
+
+Physical ward connectivity is derived only from telemetry freshness: `LIVE` at 15 seconds or less, `STALE` above 15 through 30 seconds, and `OFFLINE` above 30 seconds. Retained status, panic and RFID messages never refresh `last_seen`, so Raspberry Pi gateway availability is not confused with ESP32 ward availability.
+
 Frontend integration should fetch `/api/hospital/latest` once for initial state and then use `/ws/hospital` for realtime updates instead of high-frequency polling.
 
 The panic MQTT topic is handled separately from telemetry JSON so `EMERGENCY` / `NORMAL` never enter the Pydantic telemetry parser.
+
+## Frontend
+
+The Vite/React application lives in `medicore-dashboard/` and provides the Ambulance, Nurse and Doctor demo portals. It fetches the initial ward state through REST, reconnects the hospital WebSocket automatically, resolves RFID identities through the backend, and displays physical panic changes without a page refresh.
+
+Copy `medicore-dashboard/.env.example` to a local ignored environment file and set:
+
+```text
+VITE_CAREGRID_API_URL=http://YOUR_RASPBERRY_PI_IP:8000
+VITE_CAREGRID_WS_URL=ws://YOUR_RASPBERRY_PI_IP:8000/ws/hospital
+VITE_DEMO_MODE=false
+```
 
 ## Home Assistant
 
