@@ -1,0 +1,37 @@
+Source
+World Health Organization — Medication Without Harm
+Again, this is an authoritative WHO source rather than a research paper.
+What it addresses
+The initiative focuses on reducing avoidable harm associated with medication use.
+Important areas include:
+Medication errors
+Prescribing
+Dispensing
+Administration
+Patient involvement
+Communication
+Medication safety across healthcare transitions
+WHO has estimated the global cost associated with medication errors at approximately US$42 billion annually.
+CAREGRID future connection
+This supports the future extension:
+RFID Patient ID
+      ↓
+Secure Patient Record
+      ↓
+Prescribed Medication
+      ↓
+Dose
+      ↓
+Scheduled Time
+      ↓
+Nurse Dashboard Reminder
+Safety boundary
+CAREGRID should not:
+Prescribe medication
+Change the prescribed dose
+Decide treatment
+Replace the doctor
+Instead:
+CAREGRID displays authorized medication information and provides workflow reminders.
+Design decision
+The RFID and medication features should therefore be described as future care-coordination functionality, not as autonomous medication management

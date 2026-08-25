@@ -1,0 +1,37 @@
+Internet of medical things: A systematic review
+Authors: Chenxi Huang, Jian Wang, Shuihua Wang, Yudong Zhang
+Journal: Neurocomputing
+Year: 2023
+Article: 126719
+DOI: 10.1016/j.neucom.2023.126719
+What the paper is about
+This paper provides a systematic review of the Internet of Medical Things (IoMT) and its use in healthcare.
+It examines how connected healthcare devices and sensing technologies can be used to collect, transmit and process medical information.
+The review considers the broader IoMT ecosystem, including connected devices, communication, intelligent processing and healthcare applications.
+Main concepts
+IoMT connects healthcare devices.
+Sensors and medical devices can act as connected nodes rather than isolated devices.
+Data moves through multiple layers.
+A healthcare IoT system commonly includes sensing, communication, processing and application layers.
+Healthcare IoT has challenges.
+Important challenges include:
+Security
+Privacy
+Reliability
+Interoperability
+Scalability
+Data management
+CAREGRID connection
+CAREGRID applies the IoMT concept through:
+Sensor Layer
+↓
+Gateway / Communication
+↓
+Processing
+↓
+Hospital Dashboard
+The individual CAREGRID sensors therefore form part of a wider IoMT-style architecture.
+Design decision influenced
+Keep CAREGRID modular, so individual sensor nodes can be expanded without redesigning the complete system.
+What this paper does NOT prove
+It does not prove that CAREGRID's current prototype is clinically effective. It provides background and architecture guidance.

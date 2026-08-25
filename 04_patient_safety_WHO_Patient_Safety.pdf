@@ -1,0 +1,32 @@
+Source
+World Health Organization — Patient Safety
+This is an authoritative healthcare source, not a research paper.
+What it covers
+WHO describes patient safety as a fundamental part of healthcare quality.
+The source highlights harm that can occur because of unsafe healthcare processes and includes areas such as:
+Medication errors
+Diagnostic errors
+Healthcare-associated infections
+Falls
+Patient identification problems
+Other preventable adverse events
+WHO states that approximately 1 in 10 patients is harmed in healthcare, making patient safety a strong justification for systems intended to improve monitoring and response.
+CAREGRID connection
+CAREGRID is designed around operational safety events including:
+Bed-exit events
+IV-low events
+Fall/SOS events
+Nurse-call events
+Emergency response
+Design decision
+CAREGRID is designed as a monitoring and coordination system rather than an autonomous treatment system.
+Why this matters
+The safety source supports the problem motivation, but it does not validate CAREGRID's technology.
+Your research chain should be:
+Patient safety problem
+        ↓
+Healthcare literature
+        ↓
+CAREGRID design
+        ↓
+Prototype validation
