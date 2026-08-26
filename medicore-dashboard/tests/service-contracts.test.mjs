@@ -2,6 +2,7 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import { readFile } from "node:fs/promises";
 import { getHospitalFallbackData, searchDemoMedicine } from "../src/data/demoHospitalData.js";
+import { findDemoDoctorByUid, findDemoPatientById, findDemoPatientByUid, getDemoRfidResult } from "../src/data/demoPatientData.js";
 
 const read=path=>readFile(new URL(path,import.meta.url),"utf8");
 test("hospital realtime service uses the requested REST and WebSocket contracts",async()=>{const service=await read("../src/services/hospitalRealtimeService.js"),config=await read("../src/config.js");assert.ok(service.includes("/api/hospital/latest"));assert.ok(config.includes("/ws/hospital"));assert.match(service,/new WebSocketImpl/)});
@@ -11,3 +12,5 @@ test("client source contains no MQTT credentials or direct MQTT client",async()=
 test("sensor UI does not hardcode readings or the Pi address",async()=>{const files=["../src/pages/nurse/RealtimeDashboard.jsx","../src/pages/nurse/RealtimeRFID.jsx","../src/hooks/useCareGridRealtime.js"];for(const file of files){const source=await read(file);assert.equal(source.includes("10.15.43.187"),false);assert.equal(source.includes("Math.random"),false)}});
 test("demo role switcher remains explicitly gated",async()=>{const source=await read("../src/layouts/RoleLayout.jsx");assert.match(source,/DEMO_MODE&&/)});
 test("hospital and pharmacy demo fallbacks are ranked, searchable and explicitly marked",()=>{const hospitals=getHospitalFallbackData();assert.equal(hospitals.length,5);assert.equal(hospitals[0].name,"Ganga Hospital");assert.ok(hospitals.every((item,index)=>index===0||hospitals[index-1].score>=item.score));assert.ok(hospitals.every(item=>item.demoData));assert.equal(hospitals.filter(item=>item.departmentAvailable).length,4);assert.equal(searchDemoMedicine("adrenaline").length,5);assert.equal(searchDemoMedicine("INSU").length,5);assert.equal(searchDemoMedicine("atro").length,5)});
+test("RFID demo fallback normalizes verified patient, doctor, reserved and unknown tags",()=>{assert.equal(findDemoPatientByUid(" d0:da:f6:5f ").patient_id,"PATIENT-001");assert.equal(findDemoPatientById("patient-002").name,"Akshitha");assert.equal(findDemoDoctorByUid("aa:b4:32:06").doctor_id,"DOC-001");assert.equal(getDemoRfidResult("D0:DA:F6:5F").record.blood_group,"O+");assert.equal(getDemoRfidResult("04:06:96:04").reserved,true);assert.equal(getDemoRfidResult("00:00:00:00").found,false)});
+test("RFID service attempts the backend before centralized demo fallback",async()=>{const source=await read("../src/services/rfidService.js");assert.ok(source.indexOf("caregridRequest")<source.indexOf("getDemoRfidResult(normalized)"));assert.ok(source.includes("offline_fallback"));});

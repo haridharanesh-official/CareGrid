@@ -1,4 +1,6 @@
-import { caregridRequest, CareGridApiError } from "./caregridApi.js";
+import { caregridRequest } from "./caregridApi.js";
+import { DEMO_PATIENTS, findDemoPatientById } from "../data/demoPatientData.js";
+import { resolveRfidUid } from "./rfidService.js";
 
 const normalizePatient = item => {
   const allergies = !item.allergies || item.allergies.toLowerCase() === "none recorded" ? [] : [item.allergies];
@@ -24,24 +26,24 @@ const normalizePatient = item => {
 };
 
 export async function getPatients() {
-  const response = await caregridRequest("/api/patients");
-  return (response.items || []).map(normalizePatient);
+  try {
+    const response = await caregridRequest("/api/patients");
+    return (response.items || []).map(normalizePatient);
+  } catch {
+    return DEMO_PATIENTS.map(normalizePatient);
+  }
 }
 
 export async function getPatient(id) {
-  return normalizePatient(await caregridRequest(`/api/patients/${encodeURIComponent(id)}`));
+  try { return normalizePatient(await caregridRequest(`/api/patients/${encodeURIComponent(id)}`)); }
+  catch (error) { const demo=findDemoPatientById(id); if(demo)return normalizePatient(demo); throw error; }
 }
 
 export async function getPatientByRfid(uid) {
-  try {
-    const response = await caregridRequest(`/api/rfid/${encodeURIComponent(uid)}`);
-    return response.known && response.entity_type === "patient"
-      ? normalizePatient({ ...response.entity, rfid_uid: response.uid, demo_data: response.demo_data })
-      : null;
-  } catch (error) {
-    if (error instanceof CareGridApiError && error.status === 404) return null;
-    throw error;
-  }
+  const response = await resolveRfidUid(uid);
+  return response?.known && response.entity_type === "patient"
+    ? normalizePatient({ ...response.entity, rfid_uid: response.uid, demo_data: response.demo_data })
+    : null;
 }
 
 export async function registerPatient() {
