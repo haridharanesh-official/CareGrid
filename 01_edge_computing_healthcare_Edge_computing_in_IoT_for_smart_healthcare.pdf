@@ -1,0 +1,31 @@
+Edge computing in IoT for smart healthcare
+Authors: Mahdi Safaei Yaraziz, Nader Sohrabi Safa, Muhammad Ajmal Azad
+Journal: Journal of Ambient Intelligence and Smart Environments
+Year: 2024
+DOI: 10.3233/AIS-230009
+What the paper is about
+This paper reviews the role of edge computing within IoT-based healthcare systems. Instead of sending all healthcare data to a remote cloud, edge computing moves processing closer to the devices generating the data.
+The review discusses the growing use of IoT devices in healthcare and the need to process healthcare information efficiently. It considers issues such as latency, communication overhead, privacy, system architecture, and the challenges associated with deploying edge-enabled healthcare systems.
+Main points relevant to CAREGRID
+IoT devices generate large amounts of data.
+Healthcare sensors continuously produce information that may need rapid processing.
+Edge computing moves processing closer to the source.
+This can reduce dependence on remote cloud services and can be useful for time-sensitive applications.
+Healthcare has stronger privacy and reliability requirements.
+Patient-related systems cannot treat data processing as an ordinary IoT problem. Security, reliability and privacy have to be considered during architecture design.
+Edge systems can support intelligent healthcare applications.
+The edge can act as an intermediate computational layer between sensors and remote services.
+CAREGRID connection
+Our architecture follows:
+Ward Sensors
+      ↓
+Raspberry Pi Gateway / Edge Layer
+      ↓
+MQTT / Local Processing
+      ↓
+CAREGRID Dashboard
+The paper therefore supports the architectural decision to place a local computing layer between the sensors and the application.
+Design decision influenced
+Use an edge/gateway layer so that ward data does not have to depend completely on a remote cloud service for local monitoring.
+Limitation
+The paper does not prove that CAREGRID itself will achieve a particular latency or accuracy. Those values must be measured experimentally in our prototype.

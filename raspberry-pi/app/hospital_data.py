@@ -621,9 +621,34 @@ def _pharmacy_items(query: str, hospital_id: str | None = None) -> list[dict[str
 
 
 @hospital_router.get("/pharmacy/search")
-def search_pharmacy(q: str = Query(default="", max_length=120)) -> dict[str, Any]:
-    items = _pharmacy_items(q)
-    return {"count": len(items), "items": items, "data_classification": "hackathon_simulation"}
+def search_pharmacy(
+    query: str | None = Query(default=None, max_length=120),
+    q: str | None = Query(default=None, max_length=120),
+) -> dict[str, Any]:
+    """Search cross-hospital stock; ``q`` remains a temporary compatibility alias."""
+    term = (query if query is not None else q or "").strip()
+    items = _pharmacy_items(term)
+    results = [
+        {
+            "id": item["id"],
+            "hospital_id": item["hospital_id"],
+            "hospital": item["hospital"],
+            "medicine": item["medicine"],
+            "available": max(0, item["available_quantity"]),
+            "reserved": item["reserved_quantity"],
+            "reorder_level": item["reorder_level"],
+            "expiry_date": item["expiry_date"],
+            "updated": item["last_updated"],
+            "demo_data": True,
+        }
+        for item in items
+    ]
+    return {
+        "query": term,
+        "count": len(results),
+        "results": results,
+        "data_classification": "hackathon_simulation",
+    }
 
 
 @hospital_router.get("/hospitals/{hospital_id}/pharmacy")

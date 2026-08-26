@@ -1,27 +1,27 @@
 import { caregridRequest } from "./caregridApi.js";
 
 const normalize = item => {
-  const available = item.available_quantity ?? item.quantity - item.reserved_quantity;
+  const available = Math.max(0, item.available ?? item.available_quantity ?? item.quantity - item.reserved_quantity);
   return {
     ...item,
     id: item.id,
     hospital: item.hospital,
     quantity: available,
-    reserved: item.reserved_quantity,
-    updated: new Date(item.last_updated).toLocaleDateString(),
+    reserved: item.reserved ?? item.reserved_quantity,
+    updated: new Date(item.updated ?? item.last_updated).toLocaleDateString(),
     travel: "—",
     status: available <= 0 ? "out" : available <= item.reorder_level ? "low" : "available",
   };
 };
 
 export async function getPharmacyInventory() {
-  const response = await caregridRequest("/api/pharmacy/search?q=");
-  return (response.items || []).map(normalize);
+  const response = await caregridRequest("/api/pharmacy/search?query=");
+  return (response.results || []).map(normalize);
 }
 
 export async function searchMedicine(query) {
-  const response = await caregridRequest(`/api/pharmacy/search?q=${encodeURIComponent(query || "")}`);
-  return (response.items || []).map(normalize);
+  const response = await caregridRequest(`/api/pharmacy/search?query=${encodeURIComponent(query || "")}`);
+  return (response.results || []).map(normalize);
 }
 
 export async function getCrossHospitalMedicineAvailability(query) {

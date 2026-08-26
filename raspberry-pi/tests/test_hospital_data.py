@@ -75,10 +75,14 @@ class HospitalDataTests(unittest.TestCase):
 
     def test_pharmacy_search_returns_each_hospital_and_varied_stock(self) -> None:
         hospital_data.seed_demo_data()
-        response = hospital_data.search_pharmacy("Adrenaline")
+        response = hospital_data.search_pharmacy("Adrenaline", None)
         self.assertEqual(response["count"], 5)
-        self.assertEqual(len({item["hospital_id"] for item in response["items"]}), 5)
-        self.assertGreater(len({item["quantity"] for item in response["items"]}), 1)
+        self.assertEqual(response["query"], "Adrenaline")
+        self.assertEqual(len({item["hospital_id"] for item in response["results"]}), 5)
+        self.assertGreater(len({item["available"] for item in response["results"]}), 1)
+        self.assertTrue(all(item["available"] >= 0 for item in response["results"]))
+        self.assertEqual(hospital_data.search_pharmacy("ins", None)["count"], 5)
+        self.assertEqual(hospital_data.search_pharmacy(None, "salbu")["count"], 5)
         central = hospital_data.get_hospital_pharmacy("HOSP-001", "Adrenaline")
         self.assertEqual(central["count"], 1)
         self.assertEqual(central["items"][0]["medicine"], "Adrenaline")
