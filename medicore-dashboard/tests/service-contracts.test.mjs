@@ -1,6 +1,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { readFile } from "node:fs/promises";
+import { getHospitalFallbackData, searchDemoMedicine } from "../src/data/demoHospitalData.js";
 
 const read=path=>readFile(new URL(path,import.meta.url),"utf8");
 test("hospital realtime service uses the requested REST and WebSocket contracts",async()=>{const service=await read("../src/services/hospitalRealtimeService.js"),config=await read("../src/config.js");assert.ok(service.includes("/api/hospital/latest"));assert.ok(config.includes("/ws/hospital"));assert.match(service,/new WebSocketImpl/)});
@@ -9,4 +10,4 @@ test("provider never imports or substitutes demo sensor telemetry",async()=>{con
 test("client source contains no MQTT credentials or direct MQTT client",async()=>{const files=["../src/services/hospitalRealtimeService.js","../src/hooks/useCareGridRealtime.js","../src/app/providers.jsx"];for(const file of files){const source=(await read(file)).toLowerCase();assert.equal(source.includes("mqtt_password"),false);assert.equal(source.includes("mqtt://"),false);assert.equal(source.includes("mosquitto"),false)}});
 test("sensor UI does not hardcode readings or the Pi address",async()=>{const files=["../src/pages/nurse/RealtimeDashboard.jsx","../src/pages/nurse/RealtimeRFID.jsx","../src/hooks/useCareGridRealtime.js"];for(const file of files){const source=await read(file);assert.equal(source.includes("10.15.43.187"),false);assert.equal(source.includes("Math.random"),false)}});
 test("demo role switcher remains explicitly gated",async()=>{const source=await read("../src/layouts/RoleLayout.jsx");assert.match(source,/DEMO_MODE&&/)});
-test("ambulance recommendations fall back to explicitly marked demo hospitals",async()=>{const service=await read("../src/services/hospitalService.js");assert.ok(service.includes("DEMO / MOCK HOSPITAL DATA"));assert.ok(service.includes("Ganga Hospital"));assert.ok(service.includes("demoRecommendations(criteria)"));assert.ok(service.includes("b.score - a.score"))});
+test("hospital and pharmacy demo fallbacks are ranked, searchable and explicitly marked",()=>{const hospitals=getHospitalFallbackData();assert.equal(hospitals.length,5);assert.equal(hospitals[0].name,"Ganga Hospital");assert.ok(hospitals.every((item,index)=>index===0||hospitals[index-1].score>=item.score));assert.ok(hospitals.every(item=>item.demoData));assert.equal(hospitals.filter(item=>item.departmentAvailable).length,4);assert.equal(searchDemoMedicine("adrenaline").length,5);assert.equal(searchDemoMedicine("INSU").length,5);assert.equal(searchDemoMedicine("atro").length,5)});

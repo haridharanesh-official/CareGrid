@@ -1,4 +1,5 @@
 import { caregridRequest } from "./caregridApi.js";
+import { searchDemoMedicine } from "../data/demoHospitalData.js";
 
 const normalize = item => {
   const available = Math.max(0, item.available ?? item.available_quantity ?? item.quantity - item.reserved_quantity);
@@ -15,13 +16,16 @@ const normalize = item => {
 };
 
 export async function getPharmacyInventory() {
-  const response = await caregridRequest("/api/pharmacy/search?query=");
-  return (response.results || []).map(normalize);
+  return searchMedicine("");
 }
 
 export async function searchMedicine(query) {
-  const response = await caregridRequest(`/api/pharmacy/search?query=${encodeURIComponent(query || "")}`);
-  return (response.results || []).map(normalize);
+  try {
+    const response = await caregridRequest(`/api/pharmacy/search?query=${encodeURIComponent(query || "")}`, { timeoutMs: 2500 });
+    return (response.results || []).map(normalize);
+  } catch {
+    return searchDemoMedicine(query).map(normalize);
+  }
 }
 
 export async function getCrossHospitalMedicineAvailability(query) {
