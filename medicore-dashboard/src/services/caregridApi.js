@@ -4,6 +4,10 @@ export class CareGridApiError extends Error {
   constructor(message, status = 0) { super(message); this.name = "CareGridApiError"; this.status = status; }
 }
 
+export function shouldUseDemoFallback(error) {
+  return error instanceof CareGridApiError && (error.status === 0 || error.status === 404 || error.status >= 500);
+}
+
 export async function caregridRequest(path, options = {}) {
   if (!CAREGRID_API_URL) throw new CareGridApiError("CareGrid API URL is not configured");
   const controller = new AbortController();

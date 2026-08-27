@@ -1,4 +1,4 @@
-import { caregridRequest } from "./caregridApi.js";
+import { caregridRequest, shouldUseDemoFallback } from "./caregridApi.js";
 import { getHospitalFallbackData } from "../data/demoHospitalData.js";
 
 const normalizeRecommendation = item => {
@@ -28,7 +28,8 @@ export async function getHospitals() {
   try {
     const response = await caregridRequest("/api/hospitals/recommend", { timeoutMs: 2500 });
     return (response.items || response.recommendations || []).map(normalizeRecommendation).sort((a, b) => b.score - a.score);
-  } catch {
+  } catch (error) {
+    if (!shouldUseDemoFallback(error)) throw error;
     return getHospitalFallbackData();
   }
 }
@@ -49,7 +50,8 @@ export async function recommendHospital(criteria = {}) {
   try {
     const response = await caregridRequest(`/api/hospitals/recommend?${params}`, { timeoutMs: 2500 });
     return (response.items || response.recommendations || []).map(normalizeRecommendation).sort((a, b) => b.score - a.score);
-  } catch {
+  } catch (error) {
+    if (!shouldUseDemoFallback(error)) throw error;
     return getHospitalFallbackData(criteria);
   }
 }

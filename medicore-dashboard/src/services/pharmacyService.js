@@ -1,4 +1,4 @@
-import { caregridRequest } from "./caregridApi.js";
+import { caregridRequest, shouldUseDemoFallback } from "./caregridApi.js";
 import { searchDemoMedicine } from "../data/demoHospitalData.js";
 
 const normalize = item => {
@@ -23,7 +23,8 @@ export async function searchMedicine(query) {
   try {
     const response = await caregridRequest(`/api/pharmacy/search?query=${encodeURIComponent(query || "")}`, { timeoutMs: 2500 });
     return (response.results || []).map(normalize);
-  } catch {
+  } catch (error) {
+    if (!shouldUseDemoFallback(error)) throw error;
     return searchDemoMedicine(query).map(normalize);
   }
 }
