@@ -13,6 +13,9 @@ from typing import Any, Iterator
 from dotenv import load_dotenv
 from fastapi import APIRouter, HTTPException, Query
 
+from . import database as resource_database
+from .repositories import hospital_repository
+
 BASE_DIR = Path(__file__).resolve().parents[1]
 load_dotenv(BASE_DIR / ".env")
 DB_PATH = Path(os.getenv("CAREGRID_DB_PATH", str(BASE_DIR / "data" / "caregrid.db")))
@@ -183,6 +186,99 @@ CREATE INDEX IF NOT EXISTS idx_pharmacy_medicine ON pharmacy_inventory(medicine)
 CREATE INDEX IF NOT EXISTS idx_patient_events_patient ON patient_events(patient_id, created_at DESC);
 """
 
+# Patient, RFID and emergency workflow tables remain owned by this module. The
+# multi-hospital capacity/inventory tables are owned by database.py.
+DOMAIN_SCHEMA = """
+CREATE TABLE IF NOT EXISTS patients (
+    patient_id TEXT PRIMARY KEY,
+    name TEXT NOT NULL,
+    blood_group TEXT,
+    allergies TEXT NOT NULL DEFAULT 'none recorded',
+    condition TEXT,
+    emergency_contact TEXT,
+    demo INTEGER NOT NULL DEFAULT 1 CHECK (demo IN (0, 1)),
+    last_updated TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS doctors (
+    doctor_id TEXT PRIMARY KEY,
+    name TEXT NOT NULL,
+    department TEXT NOT NULL,
+    demo INTEGER NOT NULL DEFAULT 1 CHECK (demo IN (0, 1)),
+    last_updated TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS nurses (
+    nurse_id TEXT PRIMARY KEY,
+    name TEXT NOT NULL,
+    department TEXT NOT NULL,
+    demo INTEGER NOT NULL DEFAULT 1 CHECK (demo IN (0, 1)),
+    last_updated TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS beds (
+    id TEXT PRIMARY KEY,
+    hospital_id TEXT NOT NULL REFERENCES hospitals(id) ON DELETE CASCADE,
+    ward TEXT NOT NULL,
+    bed_type TEXT NOT NULL,
+    status TEXT NOT NULL CHECK (status IN ('available', 'reserved', 'occupied', 'cleaning', 'unavailable')),
+    patient_id TEXT REFERENCES patients(patient_id),
+    reserved_for TEXT,
+    last_updated TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS rfid_assignments (
+    uid TEXT PRIMARY KEY,
+    entity_type TEXT NOT NULL CHECK (entity_type IN ('patient', 'doctor', 'nurse', 'reserved')),
+    entity_id TEXT,
+    active INTEGER NOT NULL DEFAULT 1 CHECK (active IN (0, 1)),
+    assigned_at TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS emergency_cases (
+    id TEXT PRIMARY KEY,
+    ambulance_id TEXT,
+    patient_id TEXT REFERENCES patients(patient_id),
+    hospital_id TEXT REFERENCES hospitals(id),
+    incident_type TEXT NOT NULL,
+    severity TEXT NOT NULL,
+    status TEXT NOT NULL,
+    heart_rate REAL,
+    spo2 REAL,
+    requested_department TEXT,
+    requested_bed TEXT,
+    eta_minutes INTEGER,
+    notes TEXT,
+    created_at TEXT NOT NULL,
+    last_updated TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS hospital_prealerts (
+    id TEXT PRIMARY KEY,
+    emergency_case_id TEXT NOT NULL REFERENCES emergency_cases(id) ON DELETE CASCADE,
+    hospital_id TEXT NOT NULL REFERENCES hospitals(id),
+    payload_json TEXT NOT NULL,
+    status TEXT NOT NULL,
+    created_at TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS medicine_reservations (
+    id TEXT PRIMARY KEY,
+    inventory_id INTEGER NOT NULL REFERENCES pharmacy_inventory(id),
+    emergency_case_id TEXT REFERENCES emergency_cases(id),
+    patient_id TEXT REFERENCES patients(patient_id),
+    quantity INTEGER NOT NULL CHECK (quantity > 0),
+    status TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    last_updated TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS patient_events (
+    id TEXT PRIMARY KEY,
+    patient_id TEXT REFERENCES patients(patient_id),
+    hospital_id TEXT REFERENCES hospitals(id),
+    event_type TEXT NOT NULL,
+    severity TEXT NOT NULL,
+    summary TEXT NOT NULL,
+    payload_json TEXT NOT NULL DEFAULT '{}',
+    created_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_beds_hospital ON beds(hospital_id, bed_type, status);
+CREATE INDEX IF NOT EXISTS idx_patient_events_patient ON patient_events(patient_id, created_at DESC);
+"""
+
 
 HOSPITALS = [
     ("HOSP-001", "CareGrid Central Hospital", 12.9716, 77.5946, "1 Central Care Road", "+91 80000 10001", 1, 1, 12, 7, 8, 3, 60, 24, 3, 1, 1, 5, "online"),
@@ -208,76 +304,21 @@ MEDICINES = [
 
 
 def init_hospital_db() -> None:
+    resource_database.configure_database(DB_PATH)
+    resource_database.initialize_database()
     with connect_db() as connection:
-        connection.executescript(SCHEMA)
+        connection.executescript(DOMAIN_SCHEMA)
         columns = {row["name"] for row in connection.execute("PRAGMA table_info(emergency_cases)")}
         if "eta_minutes" not in columns:
             connection.execute("ALTER TABLE emergency_cases ADD COLUMN eta_minutes INTEGER")
 
 
 def seed_demo_data() -> dict[str, int]:
-    """Insert deterministic hackathon demo records without duplicating core rows."""
+    """Insert deterministic simulation records without duplicating core rows."""
+    resource_database.configure_database(DB_PATH)
+    resource_counts = resource_database.seed_resource_data()
     now = utc_now()
-    expiry_base = date.today() + timedelta(days=240)
     with connect_db() as connection:
-        for hospital in HOSPITALS:
-            connection.execute(
-                """INSERT INTO hospitals VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
-                ON CONFLICT(id) DO UPDATE SET
-                    name=excluded.name, latitude=excluded.latitude, longitude=excluded.longitude,
-                    address=excluded.address, phone=excluded.phone, emergency_enabled=excluded.emergency_enabled,
-                    icu_available=excluded.icu_available, emergency_beds_total=excluded.emergency_beds_total,
-                    emergency_beds_available=excluded.emergency_beds_available, icu_beds_total=excluded.icu_beds_total,
-                    icu_beds_available=excluded.icu_beds_available, normal_beds_total=excluded.normal_beds_total,
-                    normal_beds_available=excluded.normal_beds_available, operating_rooms_available=excluded.operating_rooms_available,
-                    blood_bank_available=excluded.blood_bank_available, oxygen_available=excluded.oxygen_available,
-                    ventilators_available=excluded.ventilators_available, status=excluded.status,
-                    last_updated=excluded.last_updated""",
-                (*hospital[:-1], hospital[-1], now),
-            )
-
-        for hospital_id, names in DEPARTMENTS.items():
-            for index, name in enumerate(names, 1):
-                connection.execute(
-                    "INSERT OR IGNORE INTO departments(id,hospital_id,name,available) VALUES(?,?,?,1)",
-                    (f"DEPT-{hospital_id[-3:]}-{index:02d}", hospital_id, name),
-                )
-
-        for hospital in HOSPITALS:
-            hospital_id = hospital[0]
-            bed_groups = [
-                ("Emergency", hospital[8], hospital[9]),
-                ("ICU", hospital[10], hospital[11]),
-                ("General", hospital[12], hospital[13]),
-            ]
-            for bed_type, total, available in bed_groups:
-                for number in range(1, total + 1):
-                    status_value = "available" if number <= available else "occupied"
-                    connection.execute(
-                        """INSERT OR IGNORE INTO beds
-                        (id,hospital_id,ward,bed_type,status,patient_id,reserved_for,last_updated)
-                        VALUES(?,?,?,?,?,NULL,NULL,?)""",
-                        (f"{hospital_id}-{bed_type[:3].upper()}-{number:03d}", hospital_id, bed_type, bed_type, status_value, now),
-                    )
-
-        for hospital_index, hospital in enumerate(HOSPITALS, 1):
-            hospital_id = hospital[0]
-            for medicine_index, medicine in enumerate(MEDICINES, 1):
-                quantity = ((hospital_index * 13 + medicine_index * 7) % 58) + 3
-                if medicine == "Adrenaline":
-                    quantity = [18, 7, 14, 2, 11][hospital_index - 1]
-                reserved = min(quantity, (hospital_index + medicine_index) % 4)
-                connection.execute(
-                    """INSERT INTO pharmacy_inventory
-                    (id,hospital_id,medicine,quantity,reserved_quantity,reorder_level,expiry_date,last_updated)
-                    VALUES(?,?,?,?,?,?,?,?)
-                    ON CONFLICT(id) DO UPDATE SET medicine=excluded.medicine""",
-                    (
-                        f"MED-{hospital_index:02d}-{medicine_index:03d}", hospital_id, medicine,
-                        quantity, reserved, 8, str(expiry_base + timedelta(days=medicine_index * 3)), now,
-                    ),
-                )
-
         patients = [
             ("PATIENT-001", "Balaji", "O+", "none recorded", None, "demo placeholder", 1, now),
             ("PATIENT-002", "Akshitha", "B+", "none recorded", None, "demo placeholder", 1, now),
@@ -311,11 +352,12 @@ def seed_demo_data() -> dict[str, int]:
         )
 
         tables = [
-            "hospitals", "departments", "beds", "pharmacy_inventory", "patients", "doctors",
+            "beds", "patients", "doctors",
             "nurses", "rfid_assignments", "emergency_cases", "hospital_prealerts",
             "medicine_reservations", "patient_events",
         ]
-        return {table: connection.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0] for table in tables}
+        domain_counts = {table: connection.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0] for table in tables}
+        return {**resource_counts, **domain_counts}
 
 
 def _as_bool_fields(item: dict[str, Any], fields: tuple[str, ...]) -> dict[str, Any]:
@@ -353,7 +395,7 @@ def _requested_department(value: str | None) -> str | None:
     if not value:
         return None
     normalized = value.strip()
-    return "Emergency" if normalized.lower() == "emergency medicine" else normalized
+    return "Emergency Medicine" if normalized.lower() == "emergency" else normalized
 
 
 @hospital_router.get("/patients")
@@ -444,9 +486,11 @@ def get_rfid_assignment(uid: str) -> dict[str, Any]:
 
 @hospital_router.get("/hospitals")
 def list_hospitals() -> dict[str, Any]:
-    with connect_db() as connection:
-        items = [_hospital_payload(row) for row in connection.execute("SELECT * FROM hospitals ORDER BY name")]
-    return {"count": len(items), "items": items, "data_classification": "hackathon_simulation"}
+    items = hospital_repository.list_hospitals()
+    return {
+        "status": "ok", "source": "database", "simulation": True,
+        "count": len(items), "hospitals": items, "items": items,
+    }
 
 
 @hospital_router.get("/hospitals/recommend")
@@ -459,165 +503,105 @@ def recommend_hospitals(
     latitude: float = 12.9716,
     longitude: float = 77.5946,
 ) -> dict[str, Any]:
-    """Deterministically rank hospitals after enforcing mandatory requirements."""
+    """Compatibility ranking over database-owned resources; P0.2 will replace this."""
     department = _requested_department(department)
-    bed_key = {
-        "emergency": "emergency_beds_available",
-        "icu": "icu_beds_available",
-        "general": "normal_beds_available",
-        "normal": "normal_beds_available",
-    }.get((requested_bed or "").strip().lower())
-
-    with connect_db() as connection:
-        hospitals = connection.execute("SELECT * FROM hospitals WHERE status='online' ORDER BY id").fetchall()
-        ranked: list[dict[str, Any]] = []
-        for row in hospitals:
-            hospital = _hospital_payload(row)
-            department_ok = True
-            if department:
-                department_ok = connection.execute(
-                    "SELECT 1 FROM departments WHERE hospital_id=? AND lower(name)=lower(?) AND available=1",
-                    (hospital["id"], department),
-                ).fetchone() is not None
-            bed_available = hospital.get(bed_key, 0) if bed_key else None
-            bed_ok = bed_key is None or bed_available > 0
-            icu_ok = not icu_required or (hospital["icu_available"] and hospital["icu_beds_available"] > 0)
-            emergency_ok = not emergency_required or (hospital["emergency_enabled"] and hospital["emergency_beds_available"] > 0)
-            medicine_row = None
-            if medicine:
-                medicine_row = connection.execute(
-                    """SELECT medicine,quantity,reserved_quantity,quantity-reserved_quantity AS available_quantity
-                       FROM pharmacy_inventory WHERE hospital_id=? AND lower(medicine)=lower(?)""",
-                    (hospital["id"], medicine.strip()),
-                ).fetchone()
-            medicine_available = int(medicine_row["available_quantity"]) if medicine_row else (None if not medicine else 0)
-            medicine_ok = not medicine or medicine_available > 0
-            eligible = department_ok and bed_ok and icu_ok and emergency_ok and medicine_ok
-            if not eligible:
-                continue
-
-            distance = _distance_km(latitude, longitude, hospital["latitude"], hospital["longitude"])
-            capacity_points = min(16, hospital["emergency_beds_available"] * 1.5) + min(14, hospital["icu_beds_available"] * 2)
-            capability_points = 10 if hospital["oxygen_available"] else 0
-            capability_points += min(10, hospital["ventilators_available"] * 2)
-            capability_points += 8 if hospital["blood_bank_available"] else 0
-            capability_points += min(8, hospital["operating_rooms_available"] * 2)
-            requirement_points = (8 if department else 0) + (8 if bed_key else 0) + (8 if medicine else 0)
-            distance_points = max(0, 18 - distance * 2)
-            score = round(min(100, 25 + capacity_points + capability_points + requirement_points + distance_points))
-            reasons = []
-            if department:
-                reasons.append(f"{department} available")
-            if bed_key:
-                reasons.append(f"{requested_bed} bed available")
-            if medicine:
-                reasons.append(f"{medicine} stock available")
-            if not reasons:
-                reasons.append("Hospital is operational with available capacity")
-            availability = {
-                "requested_department": department_ok,
-                "requested_bed": bed_available,
-                "icu_beds": hospital["icu_beds_available"],
-                "emergency_beds": hospital["emergency_beds_available"],
-                "medicine": medicine_row["medicine"] if medicine_row else medicine,
-                "medicine_quantity": medicine_available,
-                "oxygen": hospital["oxygen_available"],
-                "ventilators": hospital["ventilators_available"],
-            }
-            ranked.append({
-                "hospital": hospital,
-                "score": score,
-                "eligibility": "eligible",
-                "reason": ", ".join(reasons) + ".",
-                "distance": round(distance, 1),
-                "availability": availability,
-            })
+    bed_type = (requested_bed or "").strip().upper()
+    if bed_type == "NORMAL":
+        bed_type = "GENERAL"
+    ranked: list[dict[str, Any]] = []
+    for hospital in hospital_repository.list_hospitals():
+        if hospital["status"] != "online":
+            continue
+        departments = hospital_repository.get_departments(hospital["id"]) or []
+        beds = {item["bed_type"]: item for item in (hospital_repository.get_beds(hospital["id"]) or [])}
+        medicines = hospital_repository.get_pharmacy(hospital["id"], medicine or "") or []
+        department_ok = not department or any(item["name"].lower() == department.lower() and item["available"] for item in departments)
+        bed_available = beds.get(bed_type, {}).get("available") if bed_type else None
+        bed_ok = not bed_type or bool(bed_available)
+        medicine_row = next((item for item in medicines if not medicine or item["medicine"].lower() == medicine.lower()), None)
+        medicine_available = medicine_row["available"] if medicine_row else (None if not medicine else 0)
+        eligible = (
+            department_ok and bed_ok and (not medicine or medicine_available > 0)
+            and (not icu_required or hospital["icu_beds_available"] > 0)
+            and (not emergency_required or hospital["emergency_enabled"] and hospital["emergency_beds_available"] > 0)
+        )
+        if not eligible:
+            continue
+        distance = _distance_km(latitude, longitude, hospital["latitude"], hospital["longitude"])
+        score = round(min(100, 50 + min(20, hospital["emergency_beds_available"] * 2) + min(15, hospital["icu_beds_available"] * 2) + max(0, 15 - distance)))
+        reasons = [value for value in [department and f"{department} available", bed_type and f"{bed_type.title()} bed available", medicine and f"{medicine} stock available"] if value]
+        ranked.append({
+            "hospital": hospital, "score": score, "eligibility": "eligible",
+            "reason": ", ".join(reasons or ["Hospital is operational with available capacity"]) + ".",
+            "distance": round(distance, 1),
+            "availability": {
+                "requested_department": department_ok, "requested_bed": bed_available,
+                "icu_beds": hospital["icu_beds_available"], "emergency_beds": hospital["emergency_beds_available"],
+                "medicine": medicine_row["medicine"] if medicine_row else medicine, "medicine_quantity": medicine_available,
+                "oxygen": hospital["oxygen_available"], "ventilators": hospital["ventilators_available"],
+            },
+        })
 
     ranked.sort(key=lambda item: (-item["score"], item["distance"], item["hospital"]["id"]))
     for rank, item in enumerate(ranked, 1):
         item["rank"] = rank
-    return {"count": len(ranked), "items": ranked, "data_classification": "hackathon_simulation"}
+    return {"status": "ok", "source": "database", "simulation": True, "count": len(ranked), "items": ranked}
 
 
 @hospital_router.get("/hospitals/{hospital_id}")
 def get_hospital(hospital_id: str) -> dict[str, Any]:
-    with connect_db() as connection:
-        row = connection.execute("SELECT * FROM hospitals WHERE id=?", (hospital_id,)).fetchone()
-        if row is None:
-            raise HTTPException(status_code=404, detail="Hospital not found")
-        return _hospital_payload(row)
+    item = hospital_repository.get_hospital(hospital_id)
+    if item is None:
+        raise HTTPException(status_code=404, detail="Hospital not found")
+    return {"status": "ok", "source": "database", "simulation": True, **item}
 
 
 @hospital_router.get("/hospitals/{hospital_id}/beds")
 def get_hospital_beds(hospital_id: str) -> dict[str, Any]:
-    with connect_db() as connection:
-        if connection.execute("SELECT 1 FROM hospitals WHERE id=?", (hospital_id,)).fetchone() is None:
-            raise HTTPException(status_code=404, detail="Hospital not found")
-        rows = connection.execute("SELECT * FROM beds WHERE hospital_id=? ORDER BY bed_type,id", (hospital_id,)).fetchall()
-    return {"count": len(rows), "items": [dict(row) for row in rows], "demo_data": True}
+    items = hospital_repository.get_beds(hospital_id)
+    if items is None:
+        raise HTTPException(status_code=404, detail="Hospital not found")
+    return {"status": "ok", "source": "database", "simulation": True, "count": len(items), "beds": items, "items": items}
 
 
 @hospital_router.post("/hospitals/{hospital_id}/beds/reserve", status_code=201)
 def reserve_hospital_bed(hospital_id: str, payload: dict[str, Any]) -> dict[str, Any]:
-    bed_type = str(payload.get("bed_type") or payload.get("bedType") or "Emergency").strip().title()
-    if bed_type == "Normal":
-        bed_type = "General"
-    if bed_type not in {"Emergency", "ICU", "General"}:
-        raise HTTPException(status_code=422, detail="bed_type must be Emergency, ICU or General")
-    availability_column = {
-        "Emergency": "emergency_beds_available",
-        "ICU": "icu_beds_available",
-        "General": "normal_beds_available",
-    }[bed_type]
+    bed_type = str(payload.get("bed_type") or payload.get("bedType") or "EMERGENCY").strip().upper()
+    if bed_type == "NORMAL":
+        bed_type = "GENERAL"
+    if bed_type not in {"EMERGENCY", "ICU", "GENERAL", "TRAUMA", "PEDIATRIC"}:
+        raise HTTPException(status_code=422, detail="Unsupported bed_type")
     reservation_id = f"BEDRES-{uuid.uuid4().hex[:10].upper()}"
-    now = utc_now()
-    with connect_db() as connection:
-        bed = connection.execute(
-            "SELECT * FROM beds WHERE hospital_id=? AND bed_type=? AND status='available' ORDER BY id LIMIT 1",
-            (hospital_id, bed_type),
-        ).fetchone()
-        if bed is None:
-            raise HTTPException(status_code=409, detail=f"No {bed_type} bed is currently available")
-        connection.execute(
-            "UPDATE beds SET status='reserved',reserved_for=?,last_updated=? WHERE id=? AND status='available'",
-            (reservation_id, now, bed["id"]),
-        )
-        connection.execute(
-            f"UPDATE hospitals SET {availability_column}=MAX(0,{availability_column}-1),last_updated=? WHERE id=?",
-            (now, hospital_id),
-        )
+    try:
+        result = hospital_repository.reserve_bed(hospital_id, bed_type)
+    except ValueError as error:
+        raise HTTPException(status_code=409, detail=str(error)) from error
+    if result is None:
+        raise HTTPException(status_code=404, detail="Hospital or bed type not found")
     return {
         "reservation_id": reservation_id,
         "reservationId": reservation_id,
         "hospital_id": hospital_id,
-        "bed_id": bed["id"],
+        "bed_id": f"{hospital_id}-{bed_type}-CAPACITY",
         "bed_type": bed_type,
         "status": "reserved",
+        "available": result["available"],
         "demo_data": True,
     }
 
 
 @hospital_router.get("/hospitals/{hospital_id}/departments")
 def get_hospital_departments(hospital_id: str) -> dict[str, Any]:
-    with connect_db() as connection:
-        if connection.execute("SELECT 1 FROM hospitals WHERE id=?", (hospital_id,)).fetchone() is None:
-            raise HTTPException(status_code=404, detail="Hospital not found")
-        rows = connection.execute("SELECT * FROM departments WHERE hospital_id=? ORDER BY name", (hospital_id,)).fetchall()
-    items = [_as_bool_fields(dict(row), ("available",)) for row in rows]
-    return {"count": len(items), "items": items, "demo_data": True}
+    items = hospital_repository.get_departments(hospital_id)
+    if items is None:
+        raise HTTPException(status_code=404, detail="Hospital not found")
+    return {"status": "ok", "source": "database", "simulation": True, "count": len(items), "departments": items, "items": items}
 
 
 def _pharmacy_items(query: str, hospital_id: str | None = None) -> list[dict[str, Any]]:
-    clauses = ["lower(p.medicine) LIKE ?"]
-    values: list[Any] = [f"{query.lower()}%"]
     if hospital_id:
-        clauses.append("p.hospital_id=?")
-        values.append(hospital_id)
-    sql = f"""SELECT p.*, h.name AS hospital, p.quantity-p.reserved_quantity AS available_quantity
-              FROM pharmacy_inventory p JOIN hospitals h ON h.id=p.hospital_id
-              WHERE {' AND '.join(clauses)} ORDER BY p.medicine,h.name"""
-    with connect_db() as connection:
-        return [{**dict(row), "demo_data": True} for row in connection.execute(sql, values)]
+        return hospital_repository.get_pharmacy(hospital_id, query) or []
+    return hospital_repository.search_medicine(query)
 
 
 @hospital_router.get("/pharmacy/search")
@@ -638,26 +622,44 @@ def search_pharmacy(
             "reserved": item["reserved_quantity"],
             "reorder_level": item["reorder_level"],
             "expiry_date": item["expiry_date"],
-            "updated": item["last_updated"],
+            "status": item["status"],
+            "updated": item["updated_at"],
             "demo_data": True,
         }
         for item in items
     ]
     return {
+        "status": "ok",
+        "source": "database",
+        "simulation": True,
         "query": term,
         "count": len(results),
         "results": results,
-        "data_classification": "hackathon_simulation",
     }
 
 
 @hospital_router.get("/hospitals/{hospital_id}/pharmacy")
 def get_hospital_pharmacy(hospital_id: str, q: str = Query(default="", max_length=120)) -> dict[str, Any]:
-    with connect_db() as connection:
-        if connection.execute("SELECT 1 FROM hospitals WHERE id=?", (hospital_id,)).fetchone() is None:
-            raise HTTPException(status_code=404, detail="Hospital not found")
-    items = _pharmacy_items(q, hospital_id)
-    return {"count": len(items), "items": items, "demo_data": True}
+    items = hospital_repository.get_pharmacy(hospital_id, q)
+    if items is None:
+        raise HTTPException(status_code=404, detail="Hospital not found")
+    return {"status": "ok", "source": "database", "simulation": True, "count": len(items), "pharmacy": items, "items": items}
+
+
+@hospital_router.get("/hospitals/{hospital_id}/equipment")
+def get_hospital_equipment(hospital_id: str) -> dict[str, Any]:
+    items = hospital_repository.get_equipment(hospital_id)
+    if items is None:
+        raise HTTPException(status_code=404, detail="Hospital not found")
+    return {"status": "ok", "source": "database", "simulation": True, "count": len(items), "equipment": items, "items": items}
+
+
+@hospital_router.get("/hospitals/{hospital_id}/resources")
+def get_hospital_resources(hospital_id: str) -> dict[str, Any]:
+    item = hospital_repository.get_resource_summary(hospital_id)
+    if item is None:
+        raise HTTPException(status_code=404, detail="Hospital not found")
+    return {"status": "ok", "source": "database", "simulation": True, **item}
 
 
 def _emergency_payload(connection: sqlite3.Connection, row: sqlite3.Row) -> dict[str, Any]:

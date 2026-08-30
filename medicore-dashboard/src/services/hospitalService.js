@@ -20,14 +20,15 @@ const normalizeRecommendation = item => {
     reservable: item.eligibility ? item.eligibility === "eligible" : hospital.status === "online",
     reason: item.reason || "Operational CareGrid demo hospital.",
     availability: item.availability || {},
-    demoData: Boolean(hospital.demo_data),
+    demoData: Boolean(item.offline_fallback || hospital.offline_fallback),
+    simulationData: Boolean(hospital.simulation || hospital.is_demo || hospital.demo_data),
   };
 };
 
 export async function getHospitals() {
   try {
-    const response = await caregridRequest("/api/hospitals/recommend", { timeoutMs: 2500 });
-    return (response.items || response.recommendations || []).map(normalizeRecommendation).sort((a, b) => b.score - a.score);
+    const response = await caregridRequest("/api/hospitals", { timeoutMs: 2500 });
+    return (response.hospitals || response.items || []).map(normalizeRecommendation).sort((a, b) => b.score - a.score);
   } catch (error) {
     if (!shouldUseDemoFallback(error)) throw error;
     return getHospitalFallbackData();
