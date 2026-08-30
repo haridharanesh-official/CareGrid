@@ -149,6 +149,35 @@ class HospitalDataTests(unittest.TestCase):
             self.assertGreater(item["availability"]["requested_bed"], 0)
             self.assertGreater(item["availability"]["medicine_quantity"], 0)
 
+    def test_p02_recommendation_is_explainable_and_reports_rejections(self) -> None:
+        response = hospital_data.recommend_hospitals(
+            department="Cardiology", requested_bed="Emergency", medicine="Adrenaline",
+            emergency_required=True, latitude=11.0168, longitude=76.9558,
+        )
+        self.assertEqual(response["algorithm"]["version"], "p0.2")
+        self.assertEqual(response["evaluated_count"], 5)
+        self.assertEqual(response["recommended"], response["items"][0])
+        self.assertEqual([item["rank"] for item in response["items"]], list(range(1, response["count"] + 1)))
+        self.assertTrue(all(response["items"][index - 1]["score"] >= response["items"][index]["score"] for index in range(1, response["count"])))
+        self.assertTrue(all(item["score_breakdown"] and not item["rejection_reasons"] for item in response["items"]))
+        rejected = next(item for item in response["rejected"] if item["hospital"]["id"] == "HOSP-005")
+        self.assertIn("Required department Cardiology is unavailable", rejected["rejection_reasons"])
+
+    def test_p02_hard_filter_rejects_missing_required_medicine(self) -> None:
+        response = hospital_data.recommend_hospitals(
+            department="Emergency Medicine", requested_bed="Emergency", medicine="Not Stocked",
+            emergency_required=True,
+        )
+        self.assertEqual(response["count"], 0)
+        self.assertIsNone(response["recommended"])
+        self.assertEqual(len(response["rejected"]), 5)
+        self.assertTrue(all(any("Not Stocked" in reason for reason in item["rejection_reasons"]) for item in response["rejected"]))
+
+    def test_p02_requires_complete_gps_pair(self) -> None:
+        with self.assertRaises(HTTPException) as raised:
+            hospital_data.recommend_hospitals(latitude=11.01)
+        self.assertEqual(raised.exception.status_code, 422)
+
     def test_bed_reservation_and_prealert_workflow_remain_functional(self) -> None:
         before = next(item for item in hospital_repository.get_beds("HOSP-001") if item["bed_type"] == "EMERGENCY")
         reservation = hospital_data.reserve_hospital_bed("HOSP-001", {"bed_type": "Emergency"})

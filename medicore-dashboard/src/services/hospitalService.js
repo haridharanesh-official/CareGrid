@@ -5,21 +5,30 @@ const normalizeRecommendation = item => {
   const hospital = item.hospital || item;
   const distance = Number(item.distance ?? 0);
   const medicineQuantity = item.availability?.medicine_quantity;
+  const rejected = item.eligibility === "rejected";
   return {
     ...hospital,
     id: hospital.id,
     name: hospital.name,
     score: Number(item.score ?? 0),
     distance,
-    eta: Math.max(3, Math.round(distance * 3 + 4)),
+    eta: Number(item.eta_minutes ?? item.eta ?? Math.max(3, Math.round(distance * 3 + 4))),
     emergencyBeds: hospital.emergency_beds_available ?? 0,
     icuBeds: hospital.icu_beds_available ?? 0,
     normalBeds: hospital.normal_beds_available ?? 0,
     connected: hospital.status === "online",
     medicine: medicineQuantity == null ? true : medicineQuantity > 0,
-    reservable: item.eligibility ? item.eligibility === "eligible" : hospital.status === "online",
+    reservable: item.eligibility ? !rejected : hospital.status === "online",
     reason: item.reason || "Operational CareGrid demo hospital.",
     availability: item.availability || {},
+    department: item.availability?.requested_department_name,
+    departmentAvailable: item.availability?.requested_department,
+    medicineName: item.availability?.medicine,
+    ventilators: item.availability?.ventilators,
+    rejectionReasons: item.rejection_reasons || [],
+    scoreBreakdown: item.score_breakdown || {},
+    eligibility: item.eligibility || "eligible",
+    status: rejected ? "NOT ELIGIBLE" : hospital.status,
     demoData: Boolean(item.offline_fallback || hospital.offline_fallback),
     simulationData: Boolean(hospital.simulation || hospital.is_demo || hospital.demo_data),
   };
@@ -50,7 +59,9 @@ export async function recommendHospital(criteria = {}) {
   if (criteria.longitude != null) params.set("longitude", String(criteria.longitude));
   try {
     const response = await caregridRequest(`/api/hospitals/recommend?${params}`, { timeoutMs: 2500 });
-    return (response.items || response.recommendations || []).map(normalizeRecommendation).sort((a, b) => b.score - a.score);
+    const eligible = (response.items || response.recommendations || []).map(normalizeRecommendation).sort((a, b) => b.score - a.score);
+    const rejected = (response.rejected || []).map(normalizeRecommendation).sort((a, b) => a.distance - b.distance);
+    return [...eligible, ...rejected];
   } catch (error) {
     if (!shouldUseDemoFallback(error)) throw error;
     return getHospitalFallbackData(criteria);

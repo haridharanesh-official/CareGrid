@@ -1,20 +1,20 @@
 from __future__ import annotations
 
 import json
-import math
 import os
 import sqlite3
 import uuid
 from contextlib import contextmanager
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any, Iterator
+from typing import Annotated, Any, Iterator
 
 from dotenv import load_dotenv
 from fastapi import APIRouter, HTTPException, Query
 
 from . import database as resource_database
 from .repositories import hospital_repository
+from .services import hospital_recommendation_service
 
 BASE_DIR = Path(__file__).resolve().parents[1]
 load_dotenv(BASE_DIR / ".env")
@@ -382,22 +382,6 @@ def _hospital_payload(row: sqlite3.Row) -> dict[str, Any]:
     return _as_bool_fields(item, ("emergency_enabled", "icu_available", "blood_bank_available", "oxygen_available")) | {"demo_data": True}
 
 
-def _distance_km(latitude: float, longitude: float, target_latitude: float, target_longitude: float) -> float:
-    radius_km = 6371.0
-    lat1, lat2 = math.radians(latitude), math.radians(target_latitude)
-    delta_lat = math.radians(target_latitude - latitude)
-    delta_lon = math.radians(target_longitude - longitude)
-    value = math.sin(delta_lat / 2) ** 2 + math.cos(lat1) * math.cos(lat2) * math.sin(delta_lon / 2) ** 2
-    return radius_km * 2 * math.atan2(math.sqrt(value), math.sqrt(1 - value))
-
-
-def _requested_department(value: str | None) -> str | None:
-    if not value:
-        return None
-    normalized = value.strip()
-    return "Emergency Medicine" if normalized.lower() == "emergency" else normalized
-
-
 @hospital_router.get("/patients")
 def list_patients() -> dict[str, Any]:
     with connect_db() as connection:
@@ -495,57 +479,27 @@ def list_hospitals() -> dict[str, Any]:
 
 @hospital_router.get("/hospitals/recommend")
 def recommend_hospitals(
-    department: str | None = None,
-    requested_bed: str | None = None,
-    medicine: str | None = None,
+    department: Annotated[str | None, Query(max_length=120)] = None,
+    requested_bed: Annotated[str | None, Query(max_length=40)] = None,
+    medicine: Annotated[str | None, Query(max_length=120)] = None,
     icu_required: bool = False,
     emergency_required: bool = False,
-    latitude: float = 12.9716,
-    longitude: float = 77.5946,
+    latitude: Annotated[float | None, Query(ge=-90, le=90)] = None,
+    longitude: Annotated[float | None, Query(ge=-180, le=180)] = None,
 ) -> dict[str, Any]:
-    """Compatibility ranking over database-owned resources; P0.2 will replace this."""
-    department = _requested_department(department)
-    bed_type = (requested_bed or "").strip().upper()
-    if bed_type == "NORMAL":
-        bed_type = "GENERAL"
-    ranked: list[dict[str, Any]] = []
-    for hospital in hospital_repository.list_hospitals():
-        if hospital["status"] != "online":
-            continue
-        departments = hospital_repository.get_departments(hospital["id"]) or []
-        beds = {item["bed_type"]: item for item in (hospital_repository.get_beds(hospital["id"]) or [])}
-        medicines = hospital_repository.get_pharmacy(hospital["id"], medicine or "") or []
-        department_ok = not department or any(item["name"].lower() == department.lower() and item["available"] for item in departments)
-        bed_available = beds.get(bed_type, {}).get("available") if bed_type else None
-        bed_ok = not bed_type or bool(bed_available)
-        medicine_row = next((item for item in medicines if not medicine or item["medicine"].lower() == medicine.lower()), None)
-        medicine_available = medicine_row["available"] if medicine_row else (None if not medicine else 0)
-        eligible = (
-            department_ok and bed_ok and (not medicine or medicine_available > 0)
-            and (not icu_required or hospital["icu_beds_available"] > 0)
-            and (not emergency_required or hospital["emergency_enabled"] and hospital["emergency_beds_available"] > 0)
+    """Return P0.2 hard-filtered, database-backed and explainable recommendations."""
+    try:
+        return hospital_recommendation_service.recommend_hospitals(
+            department=department,
+            requested_bed=requested_bed,
+            medicine=medicine,
+            icu_required=icu_required,
+            emergency_required=emergency_required,
+            latitude=latitude,
+            longitude=longitude,
         )
-        if not eligible:
-            continue
-        distance = _distance_km(latitude, longitude, hospital["latitude"], hospital["longitude"])
-        score = round(min(100, 50 + min(20, hospital["emergency_beds_available"] * 2) + min(15, hospital["icu_beds_available"] * 2) + max(0, 15 - distance)))
-        reasons = [value for value in [department and f"{department} available", bed_type and f"{bed_type.title()} bed available", medicine and f"{medicine} stock available"] if value]
-        ranked.append({
-            "hospital": hospital, "score": score, "eligibility": "eligible",
-            "reason": ", ".join(reasons or ["Hospital is operational with available capacity"]) + ".",
-            "distance": round(distance, 1),
-            "availability": {
-                "requested_department": department_ok, "requested_bed": bed_available,
-                "icu_beds": hospital["icu_beds_available"], "emergency_beds": hospital["emergency_beds_available"],
-                "medicine": medicine_row["medicine"] if medicine_row else medicine, "medicine_quantity": medicine_available,
-                "oxygen": hospital["oxygen_available"], "ventilators": hospital["ventilators_available"],
-            },
-        })
-
-    ranked.sort(key=lambda item: (-item["score"], item["distance"], item["hospital"]["id"]))
-    for rank, item in enumerate(ranked, 1):
-        item["rank"] = rank
-    return {"status": "ok", "source": "database", "simulation": True, "count": len(ranked), "items": ranked}
+    except ValueError as error:
+        raise HTTPException(status_code=422, detail=str(error)) from error
 
 
 @hospital_router.get("/hospitals/{hospital_id}")
