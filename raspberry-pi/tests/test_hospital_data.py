@@ -18,6 +18,7 @@ EXPECTED_COUNTS = {
     "doctors": 1, "nurses": 1, "rfid_assignments": 7,
     "emergency_cases": 0, "hospital_prealerts": 0,
     "medicine_reservations": 0, "patient_events": 1,
+    "emergency_case_events": 0,
 }
 
 

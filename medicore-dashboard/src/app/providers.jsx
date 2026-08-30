@@ -21,7 +21,7 @@ export function CareGridProvider({children}){
   const [preAlert,setPreAlert]=useState(null);
   const [systemOpen,setSystemOpen]=useState(false);
 
-  const live=useMemo(()=>({...realtime,connectionState:realtime.status,status:realtime.status==="live"?"online":realtime.status,health:realtime.gateway,devices:realtime.device?[realtime.device]:[],events:realtime.activityLog,source:realtime.device?"live":"none"}),[realtime]);
+  const live=useMemo(()=>({...realtime,connectionState:realtime.status,status:realtime.status==="live"?"online":realtime.status,health:realtime.gateway,devices:realtime.device?[realtime.device]:[],events:realtime.activityLog,emergencyEvents:realtime.emergencyEvents||[],source:realtime.device?"live":"none"}),[realtime]);
   const alerts=useMemo(()=>[...manualAlerts,...realtime.activityLog].map(item=>({...item,acknowledged:acknowledged.has(item.id)})),[manualAlerts,realtime.activityLog,acknowledged]);
   const acknowledgeAlert=id=>setAcknowledged(current=>new Set([...current,id]));
   const addAlert=alert=>setManualAlerts(current=>[{id:`local-${Date.now()}`,timestamp:new Date().toISOString(),acknowledged:false,...alert},...current]);

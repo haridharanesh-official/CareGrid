@@ -8,6 +8,7 @@ const initialState = {status:"loading",device:null,gateway:null,transport:null,e
 export function useCareGridRealtime() {
   const [live,setLive]=useState(initialState);
   const [activityLog,setActivityLog]=useState([]);
+  const [emergencyEvents,setEmergencyEvents]=useState([]);
   const previous=useRef(null),socketRef=useRef(null),reconnectRef=useRef(null),attemptRef=useRef(0),mounted=useRef(true);
 
   const recordTransitions=useCallback(next=>{
@@ -41,7 +42,7 @@ export function useCareGridRealtime() {
       try{
         const socket=createHospitalSocket({
           open:()=>{attemptRef.current=0;setLive(current=>({...current,status:"live",error:null,reconnectAttempt:0}))},
-          message:message=>{try{ingest(JSON.parse(message.data),"live")}catch(error){setLive(current=>({...current,error:`Realtime payload rejected: ${error.message}`}))}},
+          message:message=>{try{const payload=JSON.parse(message.data);if(payload.type&&payload.type!=="hospital_update"){setEmergencyEvents(current=>[payload,...current].slice(0,100));return}ingest(payload,"live")}catch(error){setLive(current=>({...current,error:`Realtime payload rejected: ${error.message}`}))}},
           error:()=>setLive(current=>({...current,error:"Hospital realtime connection interrupted"})),
           close:()=>{if(!mounted.current)return;attemptRef.current+=1;setLive(current=>({...current,status:current.device?"reconnecting":"offline",reconnectAttempt:attemptRef.current,stale:true}));reconnectRef.current=setTimeout(connect,reconnectDelay(attemptRef.current))},
         });
@@ -59,5 +60,5 @@ export function useCareGridRealtime() {
     return()=>{mounted.current=false;clearTimeout(reconnectRef.current);clearInterval(restSafety);clearInterval(staleTimer);socketRef.current?.close()};
   },[ingest,refresh]);
 
-  return {...live,activityLog,refresh};
+  return {...live,activityLog,emergencyEvents,refresh};
 }

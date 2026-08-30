@@ -14,7 +14,7 @@ from fastapi import APIRouter, HTTPException, Query
 
 from . import database as resource_database
 from .repositories import hospital_repository
-from .services import hospital_recommendation_service
+from .services import emergency_case_service, hospital_recommendation_service
 
 BASE_DIR = Path(__file__).resolve().parents[1]
 load_dotenv(BASE_DIR / ".env")
@@ -36,6 +36,9 @@ def connect_db() -> Iterator[sqlite3.Connection]:
     try:
         yield connection
         connection.commit()
+    except Exception:
+        connection.rollback()
+        raise
     finally:
         connection.close()
 
@@ -186,6 +189,68 @@ CREATE INDEX IF NOT EXISTS idx_pharmacy_medicine ON pharmacy_inventory(medicine)
 CREATE INDEX IF NOT EXISTS idx_patient_events_patient ON patient_events(patient_id, created_at DESC);
 """
 
+
+CASE_WORKFLOW_SCHEMA = """
+CREATE TABLE IF NOT EXISTS emergency_case_events (
+    id TEXT PRIMARY KEY,
+    case_id TEXT NOT NULL REFERENCES emergency_cases(id) ON DELETE CASCADE,
+    event_type TEXT NOT NULL,
+    message TEXT NOT NULL,
+    actor_type TEXT,
+    actor_id TEXT,
+    metadata_json TEXT NOT NULL DEFAULT '{}',
+    created_at TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS caregrid_sequences (
+    name TEXT PRIMARY KEY,
+    value INTEGER NOT NULL CHECK (value >= 0)
+);
+CREATE INDEX IF NOT EXISTS idx_emergency_case_events_case ON emergency_case_events(case_id, created_at);
+"""
+
+
+def _columns(connection: sqlite3.Connection, table: str) -> set[str]:
+    return {row["name"] for row in connection.execute(f"PRAGMA table_info({table})")}
+
+
+def _migrate_case_workflow(connection: sqlite3.Connection) -> None:
+    case_columns = {
+        "case_number": "TEXT", "category": "TEXT", "patient_name": "TEXT", "patient_age": "INTEGER",
+        "patient_gender": "TEXT", "rfid_uid": "TEXT", "department_required": "TEXT", "bed_type_required": "TEXT",
+        "medicine_required": "TEXT", "equipment_required": "TEXT NOT NULL DEFAULT '[]'",
+        "ambulance_latitude": "REAL", "ambulance_longitude": "REAL", "selected_hospital_id": "TEXT",
+        "selected_hospital_name": "TEXT", "recommendation_score": "REAL", "recommendation_snapshot_json": "TEXT",
+        "updated_at": "TEXT", "confirmed_at": "TEXT", "arrived_at": "TEXT", "closed_at": "TEXT",
+        "source": "TEXT", "simulation": "INTEGER NOT NULL DEFAULT 1",
+    }
+    existing = _columns(connection, "emergency_cases")
+    for name, definition in case_columns.items():
+        if name not in existing:
+            connection.execute(f"ALTER TABLE emergency_cases ADD COLUMN {name} {definition}")
+    connection.execute(
+        """UPDATE emergency_cases SET category=COALESCE(category,incident_type),
+           department_required=COALESCE(department_required,requested_department),
+           bed_type_required=COALESCE(bed_type_required,requested_bed),
+           selected_hospital_id=COALESCE(selected_hospital_id,hospital_id),
+           updated_at=COALESCE(updated_at,last_updated),source=COALESCE(source,'legacy'),simulation=COALESCE(simulation,1)"""
+    )
+
+    alert_columns = {
+        "case_id": "TEXT", "priority": "TEXT", "sent_at": "TEXT", "acknowledged_at": "TEXT",
+        "acknowledged_by": "TEXT", "updated_at": "TEXT",
+    }
+    existing = _columns(connection, "hospital_prealerts")
+    for name, definition in alert_columns.items():
+        if name not in existing:
+            connection.execute(f"ALTER TABLE hospital_prealerts ADD COLUMN {name} {definition}")
+    connection.execute(
+        """UPDATE hospital_prealerts SET case_id=COALESCE(case_id,emergency_case_id),
+           sent_at=COALESCE(sent_at,created_at),updated_at=COALESCE(updated_at,created_at)"""
+    )
+    connection.executescript(CASE_WORKFLOW_SCHEMA)
+    connection.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_emergency_case_number ON emergency_cases(case_number)")
+    connection.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_prealert_case_unique ON hospital_prealerts(case_id)")
+
 # Patient, RFID and emergency workflow tables remain owned by this module. The
 # multi-hospital capacity/inventory tables are owned by database.py.
 DOMAIN_SCHEMA = """
@@ -308,7 +373,8 @@ def init_hospital_db() -> None:
     resource_database.initialize_database()
     with connect_db() as connection:
         connection.executescript(DOMAIN_SCHEMA)
-        columns = {row["name"] for row in connection.execute("PRAGMA table_info(emergency_cases)")}
+        _migrate_case_workflow(connection)
+        columns = _columns(connection, "emergency_cases")
         if "eta_minutes" not in columns:
             connection.execute("ALTER TABLE emergency_cases ADD COLUMN eta_minutes INTEGER")
 
@@ -354,7 +420,7 @@ def seed_demo_data() -> dict[str, int]:
         tables = [
             "beds", "patients", "doctors",
             "nurses", "rfid_assignments", "emergency_cases", "hospital_prealerts",
-            "medicine_reservations", "patient_events",
+            "medicine_reservations", "patient_events", "emergency_case_events",
         ]
         domain_counts = {table: connection.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0] for table in tables}
         return {**resource_counts, **domain_counts}
@@ -616,172 +682,142 @@ def get_hospital_resources(hospital_id: str) -> dict[str, Any]:
     return {"status": "ok", "source": "database", "simulation": True, **item}
 
 
-def _emergency_payload(connection: sqlite3.Connection, row: sqlite3.Row) -> dict[str, Any]:
-    item = dict(row)
-    patient = connection.execute("SELECT name FROM patients WHERE patient_id=?", (item["patient_id"],)).fetchone() if item["patient_id"] else None
-    hospital = connection.execute("SELECT name FROM hospitals WHERE id=?", (item["hospital_id"],)).fetchone() if item["hospital_id"] else None
-    item["patient"] = patient["name"] if patient else None
-    item["destination"] = hospital["name"] if hospital else None
-    item["demo_data"] = True
-    return item
-
-
 @hospital_router.get("/emergency-cases")
-def list_emergency_cases(limit: int = Query(default=50, ge=1, le=100)) -> dict[str, Any]:
-    with connect_db() as connection:
-        rows = connection.execute("SELECT * FROM emergency_cases ORDER BY created_at DESC LIMIT ?", (limit,)).fetchall()
-        items = [_emergency_payload(connection, row) for row in rows]
-    return {"count": len(items), "items": items, "demo_data": True}
+def list_emergency_cases(
+    status: str | None = None,
+    hospital_id: str | None = None,
+    limit: int = Query(default=50, ge=1, le=100),
+) -> dict[str, Any]:
+    try:
+        items = emergency_case_service.list_cases(status=status, hospital_id=hospital_id, limit=limit)
+    except ValueError as error:
+        raise HTTPException(status_code=422, detail=str(error)) from error
+    return {"status": "ok", "source": "database", "simulation": True, "count": len(items), "items": items}
 
 
 @hospital_router.post("/emergency-cases", status_code=201)
 def create_emergency_case(payload: dict[str, Any]) -> dict[str, Any]:
+    try:
+        return emergency_case_service.create_case(payload)
+    except ValueError as error:
+        status_code = 404 if str(error) == "Patient not found" else 422
+        raise HTTPException(status_code=status_code, detail=str(error)) from error
+
+
+@hospital_router.get("/emergency-cases/{case_id}")
+def get_emergency_case(case_id: str) -> dict[str, Any]:
+    item = emergency_case_service.get_case(case_id)
+    if item is None:
+        raise HTTPException(status_code=404, detail="Emergency case not found")
+    return item
+
+
+@hospital_router.post("/emergency-cases/{case_id}/recommend")
+def recommend_emergency_case(case_id: str) -> dict[str, Any]:
+    try:
+        item = emergency_case_service.recommend_case(case_id)
+    except ValueError as error:
+        raise HTTPException(status_code=409, detail=str(error)) from error
+    if item is None:
+        raise HTTPException(status_code=404, detail="Emergency case not found")
+    return item
+
+
+@hospital_router.post("/emergency-cases/{case_id}/confirm-destination")
+def confirm_emergency_destination(case_id: str, payload: dict[str, Any]) -> dict[str, Any]:
     hospital_id = str(payload.get("hospital_id") or payload.get("hospitalId") or "").strip()
     if not hospital_id:
         raise HTTPException(status_code=422, detail="hospital_id is required")
-    now = utc_now()
-    case_id = str(payload.get("id") or f"CASE-{uuid.uuid4().hex[:10].upper()}")
-    patient_id = payload.get("patient_id") or payload.get("patientId")
-    patient_name = payload.get("patient") or payload.get("name")
-    with connect_db() as connection:
-        if connection.execute("SELECT 1 FROM hospitals WHERE id=?", (hospital_id,)).fetchone() is None:
-            raise HTTPException(status_code=404, detail="Hospital not found")
-        if not patient_id and patient_name:
-            match = connection.execute("SELECT patient_id FROM patients WHERE lower(name)=lower(?)", (str(patient_name),)).fetchone()
-            patient_id = match["patient_id"] if match else None
-        connection.execute(
-            """INSERT INTO emergency_cases
-               (id,ambulance_id,patient_id,hospital_id,incident_type,severity,status,heart_rate,spo2,
-                requested_department,requested_bed,eta_minutes,notes,created_at,last_updated)
-               VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
-            (case_id, payload.get("ambulance_id") or payload.get("ambulanceId") or "AMB-108", patient_id, hospital_id,
-             payload.get("incident_type") or payload.get("category") or "Emergency", payload.get("severity") or "High",
-             payload.get("status") or "destination_confirmed", payload.get("heart_rate") or payload.get("heartRate"),
-             payload.get("spo2"), payload.get("requested_department") or payload.get("department"),
-             payload.get("requested_bed") or payload.get("bedType"), payload.get("eta"), payload.get("notes"), now, now),
-        )
-        row = connection.execute("SELECT * FROM emergency_cases WHERE id=?", (case_id,)).fetchone()
-        return _emergency_payload(connection, row)
+    try:
+        item = emergency_case_service.confirm_destination(case_id, hospital_id)
+    except ValueError as error:
+        raise HTTPException(status_code=409, detail=str(error)) from error
+    if item is None:
+        raise HTTPException(status_code=404, detail="Emergency case not found")
+    return item
 
 
 @hospital_router.patch("/emergency-cases/{case_id}")
 def update_emergency_case(case_id: str, payload: dict[str, Any]) -> dict[str, Any]:
-    allowed = {"status", "heart_rate", "spo2", "notes", "hospital_id", "eta_minutes"}
-    normalized = {
-        ("heart_rate" if key == "heartRate" else "hospital_id" if key == "hospitalId" else "eta_minutes" if key == "eta" else key): value
-        for key, value in payload.items()
-    }
-    changes = {key: value for key, value in normalized.items() if key in allowed}
-    if not changes:
-        raise HTTPException(status_code=422, detail="No supported emergency fields supplied")
-    changes["last_updated"] = utc_now()
-    with connect_db() as connection:
-        if connection.execute("SELECT 1 FROM emergency_cases WHERE id=?", (case_id,)).fetchone() is None:
-            raise HTTPException(status_code=404, detail="Emergency case not found")
-        assignments = ",".join(f"{key}=?" for key in changes)
-        connection.execute(f"UPDATE emergency_cases SET {assignments} WHERE id=?", (*changes.values(), case_id))
-        row = connection.execute("SELECT * FROM emergency_cases WHERE id=?", (case_id,)).fetchone()
-        return _emergency_payload(connection, row)
+    try:
+        item = emergency_case_service.update_case(case_id, payload)
+    except ValueError as error:
+        raise HTTPException(status_code=409, detail=str(error)) from error
+    if item is None:
+        raise HTTPException(status_code=404, detail="Emergency case not found")
+    return item
 
 
-def _prealert_payload(row: sqlite3.Row) -> dict[str, Any]:
-    item = dict(row)
-    item["payload"] = json.loads(item.pop("payload_json"))
-    item["delivery_status"] = "Delivered" if item["status"] == "sent" else item["status"].title()
-    item["demo_data"] = True
+@hospital_router.post("/emergency-cases/{case_id}/arrive")
+def arrive_emergency_case(case_id: str) -> dict[str, Any]:
+    try:
+        item = emergency_case_service.mark_arrived(case_id)
+    except ValueError as error:
+        raise HTTPException(status_code=409, detail=str(error)) from error
+    if item is None:
+        raise HTTPException(status_code=404, detail="Emergency case not found")
+    return item
+
+
+@hospital_router.post("/emergency-cases/{case_id}/close")
+def close_emergency_case(case_id: str) -> dict[str, Any]:
+    try:
+        item = emergency_case_service.close_case(case_id)
+    except ValueError as error:
+        raise HTTPException(status_code=409, detail=str(error)) from error
+    if item is None:
+        raise HTTPException(status_code=404, detail="Emergency case not found")
     return item
 
 
 @hospital_router.post("/prealerts", status_code=201)
 def create_prealert(payload: dict[str, Any]) -> dict[str, Any]:
+    case_id = str(payload.get("case_id") or payload.get("caseId") or "").strip()
     hospital_id = str(payload.get("hospital_id") or payload.get("hospitalId") or "").strip()
+    if not case_id:
+        created = create_emergency_case(payload)
+        case_id = created["id"]
+    case = emergency_case_service.get_case(case_id)
+    if case is None:
+        raise HTTPException(status_code=404, detail="Emergency case not found")
+    if case["status"] == "CREATED":
+        recommend_emergency_case(case_id)
     if not hospital_id:
-        raise HTTPException(status_code=422, detail="hospital_id is required")
-    patient_id = payload.get("patient_id") or payload.get("patientId")
-    patient_name = payload.get("patient") or payload.get("patient_name")
-    vitals = payload.get("vitals") if isinstance(payload.get("vitals"), dict) else {}
-    heart_rate = payload.get("heart_rate", vitals.get("heartRate", vitals.get("heart_rate")))
-    spo2 = payload.get("spo2", vitals.get("spo2"))
-    case_id = str(payload.get("case_id") or payload.get("caseId") or f"CASE-{uuid.uuid4().hex[:10].upper()}")
-    prealert_id = f"PRE-{uuid.uuid4().hex[:10].upper()}"
-    now = utc_now()
-
-    with connect_db() as connection:
-        if connection.execute("SELECT 1 FROM hospitals WHERE id=?", (hospital_id,)).fetchone() is None:
-            raise HTTPException(status_code=404, detail="Hospital not found")
-        if not patient_id and patient_name:
-            match = connection.execute("SELECT patient_id FROM patients WHERE lower(name)=lower(?)", (str(patient_name),)).fetchone()
-            patient_id = match["patient_id"] if match else None
-        if patient_id and connection.execute("SELECT 1 FROM patients WHERE patient_id=?", (patient_id,)).fetchone() is None:
-            raise HTTPException(status_code=404, detail="Patient not found")
-
-        incident = str(payload.get("incident") or payload.get("incident_type") or payload.get("category") or "Emergency")
-        severity = str(payload.get("severity") or "High")
-        department = payload.get("required_department") or payload.get("department")
-        requested_bed = payload.get("required_bed") or payload.get("requested_bed") or payload.get("bedType")
-        notes = payload.get("notes")
-        existing_case = connection.execute("SELECT 1 FROM emergency_cases WHERE id=?", (case_id,)).fetchone()
-        if existing_case:
-            connection.execute(
-                """UPDATE emergency_cases SET hospital_id=?,patient_id=COALESCE(?,patient_id),status='prealert_sent',
-                   heart_rate=COALESCE(?,heart_rate),spo2=COALESCE(?,spo2),requested_department=COALESCE(?,requested_department),
-                   requested_bed=COALESCE(?,requested_bed),last_updated=? WHERE id=?""",
-                (hospital_id, patient_id, heart_rate, spo2, department, requested_bed, now, case_id),
-            )
-        else:
-            connection.execute(
-                """INSERT INTO emergency_cases
-                   (id,ambulance_id,patient_id,hospital_id,incident_type,severity,status,heart_rate,spo2,
-                    requested_department,requested_bed,eta_minutes,notes,created_at,last_updated)
-                   VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
-                (case_id, payload.get("ambulance_id") or payload.get("ambulanceId"), patient_id, hospital_id,
-                 incident, severity, "prealert_sent", heart_rate, spo2, department, requested_bed,
-                 payload.get("eta"), notes, now, now),
-            )
-        stored_payload = {
-            **payload,
-            "case_id": case_id,
-            "patient_id": patient_id,
-            "patient": patient_name,
-            "incident": incident,
-            "severity": severity,
-            "heart_rate": heart_rate,
-            "spo2": spo2,
-            "required_department": department,
-            "required_bed": requested_bed,
-            "medicine": payload.get("medicine"),
-            "selected_hospital": hospital_id,
-            "timestamp": now,
-        }
-        connection.execute(
-            "INSERT INTO hospital_prealerts(id,emergency_case_id,hospital_id,payload_json,status,created_at) VALUES(?,?,?,?,?,?)",
-            (prealert_id, case_id, hospital_id, json.dumps(stored_payload), "sent", now),
-        )
-        if patient_id:
-            connection.execute(
-                """INSERT INTO patient_events(id,patient_id,hospital_id,event_type,severity,summary,payload_json,created_at)
-                   VALUES(?,?,?,?,?,?,?,?)""",
-                (f"EVENT-{uuid.uuid4().hex[:10].upper()}", patient_id, hospital_id, "emergency_prealert", severity.lower(),
-                 f"Emergency pre-alert sent to {hospital_id}", json.dumps(stored_payload), now),
-            )
-        row = connection.execute("SELECT * FROM hospital_prealerts WHERE id=?", (prealert_id,)).fetchone()
-    result = _prealert_payload(row)
-    result["deliveryStatus"] = result["delivery_status"]
-    result["deliveredAt"] = now
-    return result
+        snapshot = emergency_case_service.get_case(case_id)["recommendation_snapshot"] or {}
+        hospital_id = ((snapshot.get("recommended") or {}).get("hospital") or {}).get("id", "")
+    result = confirm_emergency_destination(case_id, {"hospital_id": hospital_id})
+    prealert = result["prealert"]
+    prealert["deliveredAt"] = prealert.get("sent_at")
+    return prealert
 
 
 @hospital_router.get("/prealerts")
-def list_prealerts(limit: int = Query(default=50, ge=1, le=100)) -> dict[str, Any]:
-    with connect_db() as connection:
-        rows = connection.execute("SELECT * FROM hospital_prealerts ORDER BY created_at DESC LIMIT ?", (limit,)).fetchall()
-    return {"count": len(rows), "items": [_prealert_payload(row) for row in rows], "demo_data": True}
+def list_prealerts(
+    limit: int = Query(default=50, ge=1, le=100),
+    hospital_id: str | None = None,
+    status: str | None = None,
+) -> dict[str, Any]:
+    try:
+        items = emergency_case_service.list_prealerts(hospital_id=hospital_id, status=status, limit=limit)
+    except ValueError as error:
+        raise HTTPException(status_code=422, detail=str(error)) from error
+    return {"status": "ok", "source": "database", "simulation": True, "count": len(items), "items": items}
 
 
 @hospital_router.get("/prealerts/{prealert_id}")
 def get_prealert(prealert_id: str) -> dict[str, Any]:
-    with connect_db() as connection:
-        row = connection.execute("SELECT * FROM hospital_prealerts WHERE id=?", (prealert_id,)).fetchone()
-    if row is None:
+    item = emergency_case_service.get_prealert(prealert_id)
+    if item is None:
         raise HTTPException(status_code=404, detail="Pre-alert not found")
-    return _prealert_payload(row)
+    return item
+
+
+@hospital_router.post("/prealerts/{prealert_id}/acknowledge")
+def acknowledge_prealert(prealert_id: str, payload: dict[str, Any] | None = None) -> dict[str, Any]:
+    try:
+        item = emergency_case_service.acknowledge_prealert(prealert_id, (payload or {}).get("acknowledged_by"))
+    except ValueError as error:
+        raise HTTPException(status_code=409, detail=str(error)) from error
+    if item is None:
+        raise HTTPException(status_code=404, detail="Pre-alert not found")
+    return item

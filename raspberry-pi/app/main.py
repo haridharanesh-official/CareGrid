@@ -16,6 +16,7 @@ from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, ValidationError
 
+from . import event_bus
 from .hospital_data import hospital_router, init_hospital_db, seed_demo_data
 
 BASE_DIR = Path(__file__).resolve().parents[1]
@@ -1013,6 +1014,7 @@ async def hospital_websocket(
     websocket: WebSocket,
 ) -> None:
     await websocket.accept()
+    last_event_sequence = 0
 
     print(
         "[WS] Hospital frontend connected"
@@ -1020,6 +1022,9 @@ async def hospital_websocket(
 
     try:
         while True:
+            for event in event_bus.events_after(last_event_sequence):
+                await websocket.send_json(event)
+                last_event_sequence = event["sequence"]
             await websocket.send_json(
                 {
                     "type": "hospital_update",

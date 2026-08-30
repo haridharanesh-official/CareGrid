@@ -34,6 +34,14 @@ const normalizeRecommendation = item => {
   };
 };
 
+export const normalizeRecommendationResponse = response => ({
+  eligible: (response.items || response.recommendations || []).map(normalizeRecommendation),
+  rejected: (response.rejected || []).map(normalizeRecommendation),
+  recommended: response.recommended ? normalizeRecommendation(response.recommended) : null,
+  count: response.count ?? 0,
+  snapshot: response,
+});
+
 export async function getHospitals() {
   try {
     const response = await caregridRequest("/api/hospitals", { timeoutMs: 2500 });
@@ -59,8 +67,9 @@ export async function recommendHospital(criteria = {}) {
   if (criteria.longitude != null) params.set("longitude", String(criteria.longitude));
   try {
     const response = await caregridRequest(`/api/hospitals/recommend?${params}`, { timeoutMs: 2500 });
-    const eligible = (response.items || response.recommendations || []).map(normalizeRecommendation).sort((a, b) => b.score - a.score);
-    const rejected = (response.rejected || []).map(normalizeRecommendation).sort((a, b) => a.distance - b.distance);
+    const normalized = normalizeRecommendationResponse(response);
+    const eligible = normalized.eligible.sort((a, b) => b.score - a.score);
+    const rejected = normalized.rejected.sort((a, b) => a.distance - b.distance);
     return [...eligible, ...rejected];
   } catch (error) {
     if (!shouldUseDemoFallback(error)) throw error;
