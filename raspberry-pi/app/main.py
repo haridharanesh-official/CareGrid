@@ -18,6 +18,7 @@ from pydantic import BaseModel, ValidationError
 
 from . import event_bus
 from .hospital_data import hospital_router, init_hospital_db, seed_demo_data
+from .services import hospital_node_service
 
 BASE_DIR = Path(__file__).resolve().parents[1]
 load_dotenv(BASE_DIR / ".env")
@@ -35,7 +36,7 @@ DB_PATH = Path(
 
 app = FastAPI(
     title="CareGrid Raspberry Pi Gateway",
-    version="0.3.1",
+    version="0.4.0",
 )
 
 app.add_middleware(
@@ -197,6 +198,17 @@ def topic_device_id(topic: str) -> str | None:
     ):
         return parts[2]
 
+    return None
+
+
+def hospital_node_topic(topic: str) -> tuple[str, str] | None:
+    parts = topic.split("/")
+    if (
+        len(parts) == 5
+        and parts[:3] == ["caregrid", "hospital", "nodes"]
+        and parts[4] in {"resources", "status"}
+    ):
+        return parts[3], parts[4]
     return None
 
 
@@ -596,6 +608,8 @@ def on_connect(
         mqtt_connected = True
 
     for topic in (
+        "caregrid/hospital/nodes/+/resources",
+        "caregrid/hospital/nodes/+/status",
         "caregrid/hospital/+/+/telemetry",
         "caregrid/hospital/+/+/panic",
         "caregrid/hospital/+/+/status",
@@ -660,6 +674,28 @@ def on_message(
             f"[MQTT] Invalid UTF-8 "
             f"on {topic}: {exc}"
         )
+        return
+
+    node_topic = hospital_node_topic(topic)
+    if node_topic:
+        hospital_id, message_type = node_topic
+        try:
+            payload = json.loads(raw)
+            if message_type == "resources":
+                result = hospital_node_service.apply_resource_update(payload, hospital_id)
+            else:
+                result = hospital_node_service.apply_status_update(payload, hospital_id)
+            print(f"[HOSPITAL NODE] {hospital_id} {message_type}: {result.get('applied')}")
+        except (json.JSONDecodeError, ValueError) as exc:
+            print(f"[HOSPITAL NODE] Invalid {message_type} payload on {topic}: {exc}")
+            client.publish(
+                "caregrid/alerts/gateway",
+                json.dumps({
+                    "type": "invalid_hospital_node_payload", "topic": topic,
+                    "error": str(exc), "timestamp": utc_now(),
+                }),
+                qos=1,
+            )
         return
 
     if topic.endswith("/panic"):
@@ -874,7 +910,7 @@ def root() -> dict[str, Any]:
             "CareGrid Raspberry Pi Gateway"
         ),
         "status": "running",
-        "version": "0.3.1",
+        "version": "0.4.0",
         "realtime_api": (
             "/api/hospital/latest"
         ),

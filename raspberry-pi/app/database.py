@@ -128,6 +128,26 @@ CREATE INDEX IF NOT EXISTS idx_resource_pharmacy_medicine ON pharmacy_inventory(
 CREATE INDEX IF NOT EXISTS idx_hospital_resources_hospital ON hospital_resources(hospital_id);
 CREATE UNIQUE INDEX IF NOT EXISTS idx_hospitals_code_unique ON hospitals(code);
 CREATE UNIQUE INDEX IF NOT EXISTS idx_pharmacy_hospital_medicine_unique ON pharmacy_inventory(hospital_id, medicine_name);
+
+CREATE TABLE IF NOT EXISTS hospital_nodes (
+    hospital_id TEXT PRIMARY KEY,
+    node_type TEXT NOT NULL DEFAULT 'simulated_hospital',
+    advertised_online INTEGER NOT NULL DEFAULT 0 CHECK (advertised_online IN (0, 1)),
+    last_seen TEXT,
+    age_seconds REAL,
+    connection_status TEXT NOT NULL DEFAULT 'OFFLINE'
+        CHECK (connection_status IN ('LIVE', 'STALE', 'OFFLINE')),
+    resource_version INTEGER NOT NULL DEFAULT 0 CHECK (resource_version >= 0),
+    last_status_sequence INTEGER NOT NULL DEFAULT 0 CHECK (last_status_sequence >= 0),
+    resource_updated_at TEXT,
+    status_updated_at TEXT,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    FOREIGN KEY (hospital_id) REFERENCES hospitals(id) ON DELETE CASCADE
+);
+
+CREATE INDEX IF NOT EXISTS idx_hospital_nodes_status
+ON hospital_nodes(connection_status, last_seen);
 """
 
 
@@ -245,6 +265,11 @@ def _upsert(connection: sqlite3.Connection, table: str, values: dict[str, Any], 
         f"INSERT INTO {table} ({columns}) VALUES ({placeholders}) ON CONFLICT({conflict}) DO UPDATE SET {updates}",
         tuple(filtered.values()),
     )
+
+
+def upsert_record(connection: sqlite3.Connection, table: str, values: dict[str, Any], conflict: str) -> None:
+    """Upsert a schema-compatible record, including migrated legacy tables."""
+    _upsert(connection, table, values, conflict)
 
 
 def seed_resource_data() -> dict[str, int]:

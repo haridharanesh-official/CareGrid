@@ -4,6 +4,7 @@ import math
 from typing import Any
 
 from ..repositories import hospital_repository
+from . import hospital_node_service
 
 
 ALGORITHM_VERSION = "p0.2"
@@ -87,18 +88,36 @@ def _evaluate_hospital(
     emergency_available = int(emergency_beds.get("available", 0))
 
     rejection_reasons: list[str] = []
+    rejection_codes: list[str] = []
+    warning_reasons: list[str] = []
+    warning_codes: list[str] = []
+    node = hospital_node_service.get_node(hospital["id"])
+    resource_source = node["connection_status"] if node else "DATABASE_SNAPSHOT"
+    hospital = {**hospital, "resource_source": resource_source, "resource_node": node}
+    if node and node["connection_status"] == "OFFLINE":
+        rejection_reasons.append("Hospital resource node is offline")
+        rejection_codes.append("HOSPITAL_RESOURCE_NODE_OFFLINE")
+    elif node and node["connection_status"] == "STALE":
+        warning_reasons.append("Hospital resource node data is stale")
+        warning_codes.append("HOSPITAL_RESOURCE_NODE_STALE")
     if hospital["status"].lower() != "online":
         rejection_reasons.append("Hospital is not currently operational")
+        rejection_codes.append("HOSPITAL_NOT_OPERATIONAL")
     if emergency_required and (not hospital["emergency_enabled"] or emergency_available <= 0):
         rejection_reasons.append("Emergency service or emergency bed capacity is unavailable")
+        rejection_codes.append("NO_EMERGENCY_CAPACITY")
     if not department_available:
         rejection_reasons.append(f"Required department {department} is unavailable")
+        rejection_codes.append("NO_REQUIRED_DEPARTMENT")
     if bed_type and requested_bed_available <= 0:
         rejection_reasons.append(f"No {bed_type.title()} bed is available")
+        rejection_codes.append("NO_REQUIRED_BED")
     if medicine and medicine_available <= 0:
         rejection_reasons.append(f"Required medicine {medicine} is unavailable")
+        rejection_codes.append("NO_REQUIRED_MEDICINE")
     if icu_required and icu_available <= 0:
         rejection_reasons.append("No ICU bed is available")
+        rejection_codes.append("NO_ICU_BED")
 
     distance = _distance_km(latitude, longitude, hospital["latitude"], hospital["longitude"])
     eta_minutes = max(3, round(distance * 1.8 + 4))
@@ -122,6 +141,10 @@ def _evaluate_hospital(
         "eta_minutes": eta_minutes,
         "availability": availability,
         "rejection_reasons": rejection_reasons,
+        "rejection_codes": rejection_codes,
+        "warning_reasons": warning_reasons,
+        "warning_codes": warning_codes,
+        "resource_source": resource_source,
     }
     if rejection_reasons:
         return {
@@ -145,6 +168,8 @@ def _evaluate_hospital(
         "emergency_readiness": _score_component(emergency_score, SCORE_WEIGHTS["emergency_readiness"]),
     }
     score = round(sum(component["points"] for component in breakdown.values()))
+    if warning_codes:
+        score = max(0, score - 15)
     capability_parts = []
     if department:
         capability_parts.append(f"{department} is available")
@@ -158,7 +183,9 @@ def _evaluate_hospital(
         "score": score,
         "match_score": score,
         "score_breakdown": breakdown,
-        "reason": f"{hospital['name']} is suitable because " + ", ".join(capability_parts) + ".",
+        "reason": f"{hospital['name']} is suitable because " + ", ".join(capability_parts) + (
+            "; hospital resource data is stale, so readiness is reduced." if warning_codes else "."
+        ),
     }
 
 

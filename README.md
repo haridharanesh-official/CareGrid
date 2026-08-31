@@ -146,6 +146,8 @@ POST  /api/emergency-cases
 POST  /api/prealerts
 GET   /api/prealerts
 GET   /api/prealerts/{id}
+GET   /api/hospital-nodes
+GET   /api/hospital-nodes/{hospital_id}
 ```
 
 Hospital, patient, RFID and pharmacy seed records are hackathon demo data. Seed initialization is idempotent; the runtime SQLite database is not committed.
@@ -153,6 +155,12 @@ Hospital, patient, RFID and pharmacy seed records are hackathon demo data. Seed 
 Physical ward connectivity is derived only from telemetry freshness: `LIVE` at 15 seconds or less, `STALE` above 15 through 30 seconds, and `OFFLINE` above 30 seconds. Retained status, panic and RFID messages never refresh `last_seen`, so Raspberry Pi gateway availability is not confused with ESP32 ward availability.
 
 Frontend integration should fetch `/api/hospital/latest` once for initial state and then use `/ws/hospital` for realtime updates instead of high-frequency polling.
+
+## Multi-Hospital Node Simulator
+
+CareGrid can run one physical ward/hospital path alongside four software-simulated hospital resource nodes for reproducible scalability testing. `HOSP-002` through `HOSP-005` publish deterministic bed, department, equipment, pharmacy, status, and version snapshots under `caregrid/hospital/nodes/{hospital_id}/...`. The Raspberry Pi gateway validates and synchronizes those snapshots into SQLite, and the unchanged database-backed recommendation flow responds to the new state.
+
+This is a software simulation, not a real multi-hospital deployment. See [the P0.4 architecture](docs/architecture/multi-hospital-node-simulator.md) and [simulator usage](raspberry-pi/simulator/README.md).
 
 The panic MQTT topic is handled separately from telemetry JSON so `EMERGENCY` / `NORMAL` never enter the Pydantic telemetry parser.
 

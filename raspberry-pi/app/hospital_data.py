@@ -14,7 +14,7 @@ from fastapi import APIRouter, HTTPException, Query
 
 from . import database as resource_database
 from .repositories import hospital_repository
-from .services import emergency_case_service, hospital_recommendation_service
+from .services import emergency_case_service, hospital_node_service, hospital_recommendation_service
 
 BASE_DIR = Path(__file__).resolve().parents[1]
 load_dotenv(BASE_DIR / ".env")
@@ -541,6 +541,21 @@ def list_hospitals() -> dict[str, Any]:
         "status": "ok", "source": "database", "simulation": True,
         "count": len(items), "hospitals": items, "items": items,
     }
+
+
+@hospital_router.get("/hospital-nodes")
+def list_hospital_nodes() -> dict[str, Any]:
+    items = hospital_node_service.list_nodes()
+    return {"status": "ok", "count": len(items), "items": items}
+
+
+@hospital_router.get("/hospital-nodes/{hospital_id}")
+def get_hospital_node(hospital_id: str) -> dict[str, Any]:
+    item = hospital_node_service.get_node(hospital_id.upper())
+    if item is None:
+        raise HTTPException(status_code=404, detail="Hospital node not found")
+    resources = hospital_repository.get_resource_summary(item["hospital_id"])
+    return {"status": "ok", "node": item, "resources": resources}
 
 
 @hospital_router.get("/hospitals/recommend")
